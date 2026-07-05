@@ -1,0 +1,193 @@
+import React, {useState, useRef, useCallback} from 'react';
+import {Box, Text, useInput, useBoxMetrics, type DOMElement} from 'ink';
+import type {Thread} from '../../types/instagram.js';
+import {useMouse} from '../context/mouse-context.js';
+import {
+	findChildAtPosition,
+	measureAbsoluteLayout,
+} from '../hooks/use-content-size.js';
+import ThreadItem from './thread-item.js';
+
+type ThreadListProperties = {
+	readonly threads: Thread[];
+	readonly onSelect: (thread: Thread) => void;
+	readonly onScrollToBottom?: () => void;
+	readonly isSearchMode?: boolean;
+};
+
+export default function ThreadList({
+	threads,
+	onSelect,
+	onScrollToBottom,
+	// isSearchMode can be used for future enhancements like showing match scores
+	isSearchMode: _isSearchMode = false,
+}: ThreadListProperties) {
+	const [selectedIndex, setSelectedIndex] = useState(0);
+	const [scrollOffset, setScrollOffset] = useState(0);
+	const [hoveredIndex, setHoveredIndex] = useState(-1);
+
+	const containerReference = useRef<DOMElement>(null as unknown as DOMElement);
+	// Item height is constant because content is always truncated to fit the height
+	const itemHeight = 4;
+
+	// useBoxMetrics re-renders automatically on layout changes (terminal resize, sibling changes, etc.)
+	const {height: containerHeight, hasMeasured} =
+		useBoxMetrics(containerReference);
+	const viewportSize = hasMeasured
+		? Math.max(1, Math.floor(containerHeight / itemHeight))
+		: 10; // sensible default until the first layout pass
+
+	useInput((input, key) => {
+		if (threads.length === 0) return;
+
+		if (input === 'j' || key.downArrow) {
+			const newIndex = Math.min(selectedIndex + 1, threads.length - 1);
+			setSelectedIndex(newIndex);
+
+			// Scroll down if selection moves below the viewport
+			if (newIndex >= scrollOffset + viewportSize) {
+				setScrollOffset(previous => previous + 1);
+			}
+
+			// Trigger load more when reaching the bottom
+			if (newIndex === threads.length - 1 && onScrollToBottom) {
+				onScrollToBottom();
+			}
+		} else if (input === 'k' || key.upArrow) {
+			const newIndex = Math.max(selectedIndex - 1, 0);
+			setSelectedIndex(newIndex);
+
+			// Scroll up if selection moves above the viewport
+			if (newIndex < scrollOffset) {
+				setScrollOffset(previous => previous - 1);
+			}
+		} else if (key.return && threads[selectedIndex]) {
+			onSelect(threads[selectedIndex]);
+		}
+	});
+
+	// Handle mouse events for the thread list
+	useMouse(
+		useCallback(
+			event => {
+				if (threads.length === 0) return false;
+
+				// Scroll wheel moves the selected index and scrolls the viewport
+				if (event.name === 'scroll-up') {
+					setSelectedIndex(previous => {
+						const newIndex = Math.max(previous - 1, 0);
+						setScrollOffset(prevOffset =>
+							newIndex < prevOffset ? prevOffset - 1 : prevOffset,
+						);
+						return newIndex;
+					});
+					return true;
+				}
+
+				if (event.name === 'scroll-down') {
+					setSelectedIndex(previous => {
+						const newIndex = Math.min(previous + 1, threads.length - 1);
+						setScrollOffset(prevOffset =>
+							newIndex >= prevOffset + viewportSize
+								? prevOffset + 1
+								: prevOffset,
+						);
+						// Trigger load more when reaching the bottom
+						if (newIndex === threads.length - 1 && onScrollToBottom) {
+							onScrollToBottom();
+						}
+
+						return newIndex;
+					});
+					return true;
+				}
+
+				// Track hover position for mouse hover highlighting
+				if (event.name === 'move') {
+					const containerNode = containerReference.current;
+					if (!containerNode) return false;
+
+					const clickX = event.col - 1;
+					const clickY = event.row - 1;
+
+					const containerLayout = measureAbsoluteLayout(containerNode);
+					const relativeX = clickX - containerLayout.x;
+					const relativeY = clickY - containerLayout.y;
+
+					const visibleIndex = findChildAtPosition(
+						containerNode,
+						relativeX,
+						relativeY,
+					);
+
+					setHoveredIndex(visibleIndex >= 0 ? scrollOffset + visibleIndex : -1);
+					return false;
+				}
+
+				// Click to select and open a thread
+				if (event.name === 'left-press') {
+					const containerNode = containerReference.current;
+					if (!containerNode) return false;
+
+					const clickX = event.col - 1;
+					const clickY = event.row - 1;
+
+					const containerLayout = measureAbsoluteLayout(containerNode);
+					const relativeX = clickX - containerLayout.x;
+					const relativeY = clickY - containerLayout.y;
+
+					const visibleIndex = findChildAtPosition(
+						containerNode,
+						relativeX,
+						relativeY,
+					);
+
+					if (visibleIndex >= 0) {
+						const absoluteIndex = scrollOffset + visibleIndex;
+						if (absoluteIndex < threads.length && threads[absoluteIndex]) {
+							setSelectedIndex(absoluteIndex);
+							onSelect(threads[absoluteIndex]);
+							return true;
+						}
+					}
+				}
+
+				return false;
+			},
+			[threads, viewportSize, scrollOffset, onScrollToBottom, onSelect],
+		),
+	);
+
+	if (threads.length === 0) {
+		return (
+			<Box flexGrow={1} justifyContent="center" alignItems="center">
+				<Text dimColor>No threads found</Text>
+			</Box>
+		);
+	}
+
+	// Render only the threads that should be visible
+	const visibleThreads = threads.slice(
+		scrollOffset,
+		scrollOffset + viewportSize,
+	);
+
+	return (
+		<Box ref={containerReference} flexDirection="column" flexGrow={1}>
+			{visibleThreads.map((thread, index) => {
+				// The actual index in the full threads array
+				const absoluteIndex = scrollOffset + index;
+
+				return (
+					<Box key={thread.id} flexDirection="column" flexShrink={0}>
+						<ThreadItem
+							thread={thread}
+							isSelected={absoluteIndex === selectedIndex}
+							isHovered={absoluteIndex === hoveredIndex}
+						/>
+					</Box>
+				);
+			})}
+		</Box>
+	);
+}

@@ -1,0 +1,1720 @@
+import {join, extname} from 'node:path';
+import fs from 'node:fs';
+import {EventEmitter} from 'node:events';
+import {Readable} from 'node:stream';
+import {pipeline} from 'node:stream/promises';
+import {
+	type IgApiClient,
+	IgCheckpointError,
+	IgLoginTwoFactorRequiredError,
+	IgExactUserNotFoundError,
+	IgLoginBadPasswordError,
+	type DirectInboxFeedResponseThreadsItem,
+	type DirectInboxFeedResponseUsersItem,
+	type DirectThreadFeedResponseItemsItem,
+	type AccountRepositoryLoginErrorResponseTwoFactorInfo,
+	type UserStoryFeedResponseItemsItem,
+	type ReelsTrayFeedResponseTrayItem,
+	type DirectThreadRepositoryBroadcastResponseRootObject,
+	type DirectThreadRepositoryBroadcastResponsePayload,
+} from 'instagram-private-api';
+import Fuse from 'fuse.js';
+import {
+	withRealtime,
+	GraphQLSubscriptions,
+	SkywalkerSubscriptions,
+	type RealtimeClient,
+	IgApiClientExt,
+} from 'instagram_mqtt';
+import {SessionManager} from './session.js';
+import {ConfigManager} from './config.js';
+import type {
+	Thread,
+	Message,
+	User,
+	Story,
+	ListMediaItem,
+	ProfileInfo,
+} from './types/instagram.js';
+import type {
+	SessionStatus,
+	UserListItem,
+	MediaListItem,
+	MediaDetail,
+	CommentItem,
+	HashtagItem,
+	LocationItem,
+} from './types/intelligence.js';
+import {
+	parseMessageItem,
+	parseReactionEvent,
+	parseSeenEvent,
+	getBestMediaUrl,
+} from './utils/message-parser.js';
+import {createContextualLogger} from './utils/logger.js';
+import {withRateLimit} from './utils/rate-limiter.js';
+
+export type LoginResult = {
+	success: boolean;
+	error?: string;
+	username?: string;
+	checkpointError?: IgCheckpointError;
+	twoFactorInfo?: AccountRepositoryLoginErrorResponseTwoFactorInfo;
+	badPassword?: boolean;
+};
+
+export type SearchResult = {
+	thread: Thread;
+	score: number;
+};
+
+export type RealtimeStatus =
+	| 'disconnected'
+	| 'connecting'
+	| 'connected'
+	| 'error';
+
+type BroadcastResponse =
+	| DirectThreadRepositoryBroadcastResponseRootObject
+	| DirectThreadRepositoryBroadcastResponsePayload;
+
+function extractItemId(result: BroadcastResponse): string {
+	if ('payload' in result) {
+		return result.payload.item_id;
+	}
+
+	return result.item_id;
+}
+
+// eslint-disable-next-line unicorn/prefer-event-target
+export class InstagramClient extends EventEmitter {
+	public static async cleanupSessions(): Promise<void> {
+		try {
+			const configManager = ConfigManager.getInstance();
+			await configManager.initialize();
+
+			await configManager.set('login.currentUsername', undefined);
+
+			const usersDirectory = configManager.get('advanced.usersDir');
+			try {
+				const userDirectories = fs.readdirSync(usersDirectory);
+				for (const userSubdirectory of userDirectories) {
+					const sessionFile = join(
+						usersDirectory,
+						userSubdirectory,
+						'session.ts.json',
+					);
+					try {
+						fs.unlinkSync(sessionFile);
+					} catch {}
+				}
+			} catch {}
+		} catch (error) {
+			const logger = createContextualLogger('cleanupSessions');
+			logger.error('Error during session cleanup', error);
+			throw error;
+		}
+	}
+
+	public static async cleanupCache(): Promise<void> {
+		try {
+			const configManager = ConfigManager.getInstance();
+			await configManager.initialize();
+
+			const cacheDirectory = configManager.get('advanced.cacheDir');
+			const mediaDirectory = configManager.get('advanced.mediaDir');
+			const generatedDirectory = configManager.get('advanced.generatedDir');
+
+			for (const directory of [
+				cacheDirectory,
+				mediaDirectory,
+				generatedDirectory,
+			]) {
+				try {
+					const files = fs.readdirSync(directory);
+					for (const file of files) {
+						fs.unlinkSync(join(directory, file));
+					}
+				} catch {}
+			}
+		} catch (error) {
+			const logger = createContextualLogger('cleanupCache');
+			logger.error('Error during cache cleanup', error);
+			throw error;
+		}
+	}
+
+	public static async cleanupLogs(): Promise<void> {
+		try {
+			const configManager = ConfigManager.getInstance();
+			await configManager.initialize();
+
+			const logsDirectory = configManager.get('advanced.logsDir');
+			try {
+				const files = fs.readdirSync(logsDirectory);
+				for (const file of files) {
+					fs.unlinkSync(join(logsDirectory, file));
+				}
+			} catch {}
+		} catch (error) {
+			const logger = createContextualLogger('cleanupLogs');
+			logger.error('Error during logs cleanup', error);
+			throw error;
+		}
+	}
+
+	private readonly ig: IgApiClientExt;
+	private realtime: RealtimeClient | undefined;
+	private realtimeStatus: RealtimeStatus = 'disconnected';
+
+	private sessionManager: SessionManager | undefined = undefined;
+	private readonly configManager: ConfigManager;
+	private username: string | undefined = undefined;
+	private readonly userCache = new Map<string, string>();
+	private readonly logger = createContextualLogger('InstagramClient');
+
+	// Caching for user stories
+	private readonly loadedStoriesMap = new Map<number, Story[]>();
+	private hasInitializedReelsTray = false;
+
+	// Inbox feed instance for pagination
+	private inboxFeed:
+		| ReturnType<IgApiClientExt['feed']['directInbox']>
+		| undefined = undefined;
+
+	// Threads cache for search functionality
+	private threadsCache: Thread[] = [];
+	private threadsCacheTimestamp: number | undefined = undefined;
+	private readonly threadsCacheTTL = 5 * 60 * 1000; // 5 minutes
+
+	private readonly loginFlowStates: {
+		preLoginDone: boolean;
+		postLoginDone: boolean;
+	} = {
+		preLoginDone: false,
+		postLoginDone: false,
+	};
+
+	constructor(username?: string) {
+		super();
+		this.ig = new IgApiClientExt();
+		this.configManager = ConfigManager.getInstance();
+
+		if (username) {
+			this.username = username;
+			this.sessionManager = new SessionManager(username);
+		}
+	}
+
+	/**
+	 * Attempts to log in to Instagram using the provided username and password.
+	 *
+	 * Performs pre-login flow and on successful login saves session states and config values.
+	 * Handles two-factor authentication and checkpoint challenges by returning relevant information.
+	 *
+	 * @param username - The Instagram username to log in with.
+	 * @param password - The password for the specified username.
+	 * @param options - Optional settings for login, including whether to initialize the realtime connection.
+	 * @returns A promise that resolves to a `LoginResult` indicating success or failure, and additional info if required.
+	 *
+	 * @remarks
+	 * This method performs a full credential-based login, which differs from session-based login.
+	 * This is the default fallback method for session-based login when it fails (e.g. session expired)
+	 *
+	 *  @note If you do not wish to initialize realtime client, you can pass in the options parameter with false.
+	 * 		  If this is the case, all responses will be handled by the API client instead
+	 */
+	public async login(
+		username: string,
+		password: string,
+		options?: {initializeRealtime: boolean},
+	): Promise<LoginResult> {
+		const loginOptions = options ?? {initializeRealtime: true};
+		try {
+			this.username = username;
+			this.sessionManager = new SessionManager(username);
+
+			this.ig.state.generateDevice(username);
+
+			this.ig.request.end$.subscribe(async () => {
+				await this.saveSessionState();
+			});
+
+			if (!this.loginFlowStates.preLoginDone) {
+				await this.preLoginFlow();
+				// Continue even if preLoginFlow fails
+				this.loginFlowStates.preLoginDone = true;
+			}
+
+			await this.ig.account.login(username, password);
+			await this.postLoginSetup(username, {
+				initializeRealtime: loginOptions.initializeRealtime,
+			});
+
+			return {success: true, username};
+		} catch (error) {
+			if (error instanceof IgLoginTwoFactorRequiredError) {
+				return {
+					success: false,
+					twoFactorInfo: error.response.body.two_factor_info,
+				};
+			}
+
+			if (error instanceof IgCheckpointError) {
+				return {success: false, checkpointError: error};
+			}
+
+			if (error instanceof IgLoginBadPasswordError) {
+				return {
+					success: false,
+					badPassword: true,
+				};
+			}
+
+			this.logger.error('Login failed', error);
+			return {
+				success: false,
+				error: error instanceof Error ? error.message : 'Unknown login error',
+			};
+		}
+	}
+
+	public async twoFactorLogin({
+		verificationCode,
+		twoFactorIdentifier,
+		totp_two_factor_on,
+	}: {
+		verificationCode: string;
+		twoFactorIdentifier: string;
+		totp_two_factor_on: boolean;
+	}): Promise<LoginResult> {
+		if (!this.username) {
+			return {success: false, error: 'No username set for 2FA login'};
+		}
+
+		try {
+			if (!this.loginFlowStates.preLoginDone) {
+				await this.preLoginFlow();
+				// Continue even if preLoginFlow fails
+				this.loginFlowStates.preLoginDone = true;
+			}
+
+			const verificationMethod = totp_two_factor_on ? '0' : '1';
+			await this.ig.account.twoFactorLogin({
+				username: this.username,
+				verificationCode,
+				twoFactorIdentifier,
+				verificationMethod,
+			});
+			await this.postLoginSetup(this.username, {initializeRealtime: false});
+
+			return {success: true, username: this.username ?? undefined};
+		} catch (error) {
+			this.logger.error('2FA Login failed', error);
+			return {
+				success: false,
+				error: error instanceof Error ? error.message : 'Unknown 2FA error',
+			};
+		}
+	}
+
+	public async startChallenge(): Promise<void> {
+		await this.ig.challenge.auto(true);
+	}
+
+	public async sendChallengeCode(code: string): Promise<LoginResult> {
+		if (!this.username) {
+			return {success: false, error: 'No username set for challenge login'};
+		}
+
+		try {
+			await this.ig.challenge.sendSecurityCode(code);
+			await this.postLoginSetup(this.username, {initializeRealtime: false});
+
+			return {success: true, username: this.username ?? undefined};
+		} catch (error) {
+			this.logger.error('Sending challenge code failed', error);
+			return {
+				success: false,
+				error:
+					error instanceof Error ? error.message : 'Unknown challenge error',
+			};
+		}
+	}
+
+	public async loginBySession(options?: {
+		initializeRealtime: boolean;
+	}): Promise<LoginResult> {
+		// No need to perform preLoginFlow here as session login does not require it
+		// This is not verified just a guess based on the purpose of preLoginFlow...
+
+		const sessionOptions = options ?? {initializeRealtime: true};
+		if (!this.sessionManager) {
+			return {success: false, error: 'No session manager initialized'};
+		}
+
+		try {
+			const sessionData = await this.sessionManager.loadSession();
+			if (!sessionData) {
+				return {success: false, error: 'No session file found'};
+			}
+
+			if (!this.username) {
+				return {success: false, error: 'No username set for session login'};
+			}
+
+			this.ig.state.generateDevice(this.username);
+
+			this.ig.request.end$.subscribe(async () => {
+				await this.saveSessionState();
+			});
+
+			await this.ig.state.deserialize(sessionData);
+
+			await this.postLoginSetup(this.username, {
+				initializeRealtime: sessionOptions.initializeRealtime,
+			});
+			return {success: true, username: this.username ?? undefined};
+		} catch (error) {
+			if (error instanceof IgCheckpointError) {
+				return {success: false, checkpointError: error};
+			}
+
+			this.logger.error('Failed to login with session', error);
+			return {
+				success: false,
+				error: error instanceof Error ? error.message : 'Unknown session error',
+			};
+		}
+	}
+
+	/**
+	 * Checks the current session validity by attempting to fetch the current user.
+	 * Returns session status including username, userId, and session age.
+	 */
+	public async getSessionStatus(): Promise<SessionStatus> {
+		try {
+			const user = await this.ig.account.currentUser();
+			const sessionAge = await this.getSessionAge();
+			return {
+				valid: true,
+				username: user.username,
+				userId: user.pk.toString(),
+				sessionAge,
+			};
+		} catch {
+			return {valid: false};
+		}
+	}
+
+	/**
+	 * Refreshes the current session using stored session data without re-entering credentials.
+	 * Returns the new session status on success, or an invalid status on failure.
+	 */
+	public async refreshSession(): Promise<SessionStatus> {
+		const result = await this.loginBySession({initializeRealtime: false});
+		if (!result.success) {
+			return {valid: false};
+		}
+
+		return this.getSessionStatus();
+	}
+
+	/**
+	 * Fetches a page of followers for a given user ID.
+	 * Returns a list of UserListItem and an optional cursor for the next page.
+	 */
+	public async getFollowers(
+		userId: string,
+		cursor?: string,
+		count?: number,
+	): Promise<{users: UserListItem[]; nextCursor?: string}> {
+		const feed = this.ig.feed.accountFollowers(userId);
+		if (cursor) {
+			feed.deserialize(cursor);
+		}
+
+		if (count) {
+			feed.state.page_size = count;
+		}
+
+		const items = await withRateLimit(() => feed.items());
+
+		const users: UserListItem[] = items.map(item => ({
+			pk: item.pk.toString(),
+			username: item.username,
+			fullName: item.full_name,
+			isVerified: item.is_verified,
+			isPrivate: item.is_private,
+			profilePicUrl: item.profile_pic_url,
+		}));
+
+		const nextCursor = feed.isMoreAvailable() ? feed.serialize() : undefined;
+
+		return {users, nextCursor};
+	}
+
+	/**
+	 * Fetches a page of accounts that a given user ID is following.
+	 * Returns a list of UserListItem and an optional cursor for the next page.
+	 */
+	public async getFollowing(
+		userId: string,
+		cursor?: string,
+		count?: number,
+	): Promise<{users: UserListItem[]; nextCursor?: string}> {
+		const feed = this.ig.feed.accountFollowing(userId);
+		if (cursor) {
+			feed.deserialize(cursor);
+		}
+
+		if (count) {
+			feed.state.page_size = count;
+		}
+
+		const items = await withRateLimit(() => feed.items());
+
+		const users: UserListItem[] = items.map(item => ({
+			pk: item.pk.toString(),
+			username: item.username,
+			fullName: item.full_name,
+			isVerified: item.is_verified,
+			isPrivate: item.is_private,
+			profilePicUrl: item.profile_pic_url,
+		}));
+
+		const nextCursor = feed.isMoreAvailable() ? feed.serialize() : undefined;
+
+		return {users, nextCursor};
+	}
+
+	/**
+	 * Fetches a page of media for a given user ID.
+	 * Returns a list of MediaListItem and an optional cursor for the next page.
+	 */
+	public async getUserMedia(
+		userId: string,
+		cursor?: string,
+		count?: number,
+	): Promise<{items: MediaListItem[]; nextCursor?: string}> {
+		const feed = this.ig.feed.user(userId);
+		if (cursor) {
+			feed.deserialize(cursor);
+		}
+
+		if (count) {
+			(feed as any).pageSize = count;
+		}
+
+		const rawItems = await withRateLimit(() => feed.items());
+
+		const items: MediaListItem[] = rawItems.map(item => {
+			const mediaTypeMap: Record<number, 'image' | 'video' | 'carousel'> = {
+				1: 'image',
+				2: 'video',
+				8: 'carousel',
+			};
+			const captionText = (item as any).caption?.text as string | undefined;
+			const captionPreview = captionText
+				? captionText.slice(0, 100)
+				: undefined;
+
+			return {
+				id: item.id,
+				mediaType: mediaTypeMap[item.media_type] ?? 'image',
+				captionPreview,
+				timestamp: new Date(item.taken_at * 1000).toISOString(),
+				likeCount: item.like_count,
+				commentCount: item.comment_count,
+			};
+		});
+
+		const nextCursor = feed.isMoreAvailable() ? feed.serialize() : undefined;
+
+		return {items, nextCursor};
+	}
+
+	/**
+	 * Fetches detailed information about a specific media post.
+	 * Returns a MediaDetail object with full metadata including tags, hashtags, and location.
+	 */
+	public async getMediaInfo(mediaId: string): Promise<MediaDetail> {
+		const response = await withRateLimit(() => this.ig.media.info(mediaId));
+		const item = response.items[0]!;
+
+		const mediaTypeMap: Record<number, 'image' | 'video' | 'carousel'> = {
+			1: 'image',
+			2: 'video',
+			8: 'carousel',
+		};
+
+		const caption = (item as any).caption?.text as string | undefined;
+		const hashtags = caption
+			? [...caption.matchAll(/#(\w+)/g)].map(m => m[1]!)
+			: [];
+
+		const taggedUsers: string[] =
+			(item as any).usertags?.in
+				?.map((tag: any) => tag.user?.username ?? '')
+				.filter((u: string) => u !== '') ?? [];
+
+		const location = (item as any).location
+			? {
+					name: (item as any).location.name as string,
+					lat: (item as any).location.lat as number | undefined,
+					lng: (item as any).location.lng as number | undefined,
+				}
+			: undefined;
+
+		const carouselItems = (item as any).carousel_media?.map((cm: any) => {
+			const cmType: 'image' | 'video' = cm.media_type === 2 ? 'video' : 'image';
+			const cmUrl =
+				cm.media_type === 2
+					? (cm.video_versions?.[0]?.url ?? '')
+					: (cm.image_versions2?.candidates?.[0]?.url ?? '');
+			return {mediaType: cmType, url: cmUrl as string};
+		}) as Array<{mediaType: 'image' | 'video'; url: string}> | undefined;
+
+		let url = '';
+		if (item.media_type === 2) {
+			url = (item as any).video_versions?.[0]?.url ?? '';
+		} else {
+			url = (item as any).image_versions2?.candidates?.[0]?.url ?? '';
+		}
+
+		return {
+			id: item.id,
+			mediaType: mediaTypeMap[item.media_type] ?? 'image',
+			caption,
+			timestamp: new Date(item.taken_at * 1000).toISOString(),
+			likeCount: item.like_count,
+			commentCount: item.comment_count,
+			taggedUsers,
+			hashtags,
+			location,
+			carouselItems,
+			url,
+		};
+	}
+
+	/**
+	 * Fetches the list of users who liked a specific media post.
+	 * Returns a list of UserListItem.
+	 */
+	public async getMediaLikers(
+		mediaId: string,
+	): Promise<{users: UserListItem[]}> {
+		const response = await withRateLimit(() => this.ig.media.likers(mediaId));
+
+		const users: UserListItem[] = response.users.map(item => ({
+			pk: item.pk.toString(),
+			username: item.username,
+			fullName: item.full_name,
+			isVerified: item.is_verified,
+			isPrivate: item.is_private,
+			profilePicUrl: item.profile_pic_url,
+		}));
+
+		return {users};
+	}
+
+	/**
+	 * Fetches a page of comments for a specific media post.
+	 * Returns a list of CommentItem and an optional cursor for the next page.
+	 */
+	public async getMediaComments(
+		mediaId: string,
+		cursor?: string,
+		count?: number,
+	): Promise<{comments: CommentItem[]; nextCursor?: string}> {
+		const feed = this.ig.feed.mediaComments(mediaId);
+		if (cursor) {
+			feed.deserialize(cursor);
+		}
+
+		if (count) {
+			(feed as any).pageSize = count;
+		}
+
+		const items = await withRateLimit(() => feed.items());
+
+		const comments: CommentItem[] = items.map(item => ({
+			id: (item as any).pk.toString(),
+			username: (item as any).user.username as string,
+			text: (item as any).text as string,
+			timestamp: new Date(
+				((item as any).created_at as number) * 1000,
+			).toISOString(),
+			likeCount: (item as any).comment_like_count as number,
+		}));
+
+		const nextCursor = feed.isMoreAvailable() ? feed.serialize() : undefined;
+
+		return {comments, nextCursor};
+	}
+
+	/**
+	 * Searches for users by query string.
+	 * Returns a list of matching UserListItem results.
+	 */
+	public async searchUsers(query: string): Promise<UserListItem[]> {
+		const response = await withRateLimit(() => this.ig.user.search(query));
+
+		return response.users.map((user: any) => ({
+			pk: user.pk.toString(),
+			username: user.username,
+			fullName: user.full_name,
+			isVerified: user.is_verified,
+			isPrivate: user.is_private,
+			profilePicUrl: user.profile_pic_url,
+			followerCount: user.follower_count,
+		}));
+	}
+
+	/**
+	 * Searches for hashtags by query string.
+	 * Returns a list of matching HashtagItem results.
+	 */
+	public async searchHashtags(query: string): Promise<HashtagItem[]> {
+		const response = await withRateLimit(() => this.ig.tag.search(query));
+
+		return response.results.map((tag: any) => ({
+			name: tag.name,
+			mediaCount: tag.media_count,
+		}));
+	}
+
+	/**
+	 * Searches for locations by query string.
+	 * Returns a list of matching LocationItem results.
+	 */
+	public async searchLocations(query: string): Promise<LocationItem[]> {
+		const response = await withRateLimit(() => this.ig.fbsearch.places(query));
+
+		return response.items.map((item: any) => ({
+			id: item.location.pk.toString(),
+			name: item.location.name,
+			address: item.location.address,
+			lat: item.location.lat,
+			lng: item.location.lng,
+		}));
+	}
+
+	/**
+	 * Calculates session age in seconds based on the session file's modification time.
+	 */
+	private async getSessionAge(): Promise<number | undefined> {
+		if (!this.sessionManager) {
+			return undefined;
+		}
+
+		try {
+			const usersDirectory = this.configManager.get('advanced.usersDir');
+			const sessionPath = join(
+				usersDirectory,
+				this.username ?? '',
+				'session.ts.json',
+			);
+			const stat = fs.statSync(sessionPath);
+			return Math.floor((Date.now() - stat.mtimeMs) / 1000);
+		} catch {
+			return undefined;
+		}
+	}
+
+	public async logout(usernameToLogout?: string): Promise<void> {
+		try {
+			const targetUsername = usernameToLogout ?? this.username;
+			if (targetUsername) {
+				const sessionManager = new SessionManager(targetUsername);
+				await sessionManager.deleteSession();
+				if (
+					this.configManager.get('login.currentUsername') === targetUsername
+				) {
+					await this.configManager.set('login.currentUsername', undefined);
+				}
+			} else {
+				await this.configManager.set('login.currentUsername', undefined);
+			}
+		} catch (error) {
+			this.logger.error('Error during logout', error);
+			throw error;
+		}
+	}
+
+	/**
+	 * Disconnects the realtime client if it is connected.
+	 *
+	 * @remarks This destructor must be invoked by the view using the client.
+	 * However, calling this is not strictly necessary based on the library examples.
+	 * For example when the app quits by Ctrl+C, it is not disconnected but it's ok.
+	 */
+	public async shutdown(): Promise<void> {
+		if (this.realtime) {
+			await this.realtime.disconnect();
+		}
+	}
+
+	public async switchUser(username: string): Promise<void> {
+		try {
+			const sessionManager = new SessionManager(username);
+			const sessionExists = await sessionManager.sessionExists();
+
+			if (!sessionExists) {
+				throw new Error(
+					`No session found for @${username}. Please login first.`,
+				);
+			}
+
+			await this.configManager.set('login.currentUsername', username);
+			this.username = username;
+		} catch (error) {
+			this.logger.error('Error during switchUser', error);
+			throw error;
+		}
+	}
+
+	public getInstagramClient(): IgApiClient {
+		return this.ig;
+	}
+
+	public getUsername(): string | undefined {
+		return this.username;
+	}
+
+	public getRealtimeStatus(): RealtimeStatus {
+		return this.realtimeStatus;
+	}
+
+	public async getCurrentUser(): Promise<User | undefined> {
+		try {
+			const user = await this.ig.user.info(this.ig.state.cookieUserId);
+			return {
+				pk: user.pk.toString(),
+				username: user.username,
+				fullName: user.full_name,
+				profilePicUrl: user.profile_pic_url,
+				isVerified: user.is_verified,
+			};
+		} catch (error) {
+			this.logger.error('Failed to get current user', error);
+			return undefined;
+		}
+	}
+
+	/**
+	 * Fetches a full profile for the given username, including bio,
+	 * follower/following/media counts, and privacy status.
+	 */
+	public async getUserProfile(username: string): Promise<ProfileInfo> {
+		const user = await this.ig.user.searchExact(username);
+		const info = await this.ig.user.info(user.pk);
+		return {
+			pk: user.pk.toString(),
+			username: info.username,
+			fullName: info.full_name,
+			profilePicUrl: info.profile_pic_url,
+			isVerified: info.is_verified,
+			isPrivate: info.is_private,
+			biography: info.biography,
+			followerCount: info.follower_count,
+			followingCount: info.following_count,
+			mediaCount: info.media_count,
+			externalUrl: info.external_url ?? undefined,
+			isBusiness: (info as any).is_business ?? undefined,
+			accountType:
+				(info as any).account_type !== undefined
+					? String((info as any).account_type)
+					: undefined,
+			businessCategory: (info as any).category ?? undefined,
+			contactPhone: (info as any).public_phone_number || undefined,
+			contactEmail: (info as any).public_email || undefined,
+			cityName: (info as any).city_name || undefined,
+		};
+	}
+
+	public async getThreads(
+		loadMore = false,
+	): Promise<{threads: Thread[]; hasMore: boolean}> {
+		try {
+			// Create a new feed for fresh load, or reuse existing for pagination
+			if (!loadMore || !this.inboxFeed) {
+				this.inboxFeed = this.ig.feed.directInbox();
+				this.userCache.clear();
+				// Invalidate threads cache on fresh load
+				this.threadsCache = [];
+				this.threadsCacheTimestamp = undefined;
+			}
+
+			const inbox = await this.inboxFeed.items();
+
+			for (const thread of inbox) {
+				if (thread.users) {
+					for (const user of thread.users) {
+						this.userCache.set(
+							user.pk.toString(),
+							user.username ?? user.full_name ?? `User_${user.pk}`,
+						);
+					}
+				}
+			}
+
+			const threads = inbox.map(thread => ({
+				id: thread.thread_id,
+				title: this.getThreadTitle(thread),
+				users: this.getThreadUsers(thread),
+				lastMessage: this.getLastMessage(thread),
+				lastActivity: new Date(Number(thread.last_activity_at) / 1000),
+				// This field is not documented but appears to indicate unread status
+				unread: (thread as any).read_state === 1,
+			}));
+
+			// Update threads cache
+			if (loadMore) {
+				// Pagination: append to cache
+				this.threadsCache.push(...threads);
+				this.logger.debug(
+					`Appended ${threads.length} threads to cache. Total: ${this.threadsCache.length}`,
+				);
+			} else {
+				// Fresh load: replace cache
+				this.threadsCache = threads;
+				this.threadsCacheTimestamp = Date.now();
+				this.logger.debug(
+					`Initialized threads cache with ${threads.length} threads`,
+				);
+			}
+
+			return {
+				threads,
+				hasMore: this.inboxFeed.isMoreAvailable(),
+			};
+		} catch (error) {
+			this.logger.error('Failed to fetch threads', error);
+			throw error;
+		}
+	}
+
+	/**
+	 * Search for users by username and return them as search results with pending threads.
+	 *
+	 * @param username - The username to search for
+	 * @returns An array of SearchResult objects
+	 */
+	public async searchThreadByUsername(
+		username: string,
+		options?: {forceExact?: boolean},
+	): Promise<SearchResult[]> {
+		const {forceExact = false} = options ?? {};
+		// First try exact username match if requested
+		if (forceExact) {
+			try {
+				const user = await this.ig.user.searchExact(username.toLowerCase());
+				const fullName = user.full_name ? ` (${user.full_name})` : '';
+
+				// Cache user info
+				this.userCache.set(
+					user.pk.toString(),
+					user.username ?? user.full_name ?? `User_${user.pk}`,
+				);
+
+				const thread: Thread = {
+					id: `PENDING_${user.pk}`, // Virtual ID
+					title: `${user.username}${fullName}`,
+					users: [
+						{
+							pk: user.pk.toString(),
+							username: user.username,
+							fullName: user.full_name,
+							profilePicUrl: user.profile_pic_url,
+							isVerified: user.is_verified,
+						},
+					],
+					lastMessage: undefined,
+					lastActivity: new Date(),
+					unread: false,
+				};
+
+				return [{thread, score: 1}];
+			} catch (error) {
+				if (!(error instanceof IgExactUserNotFoundError)) {
+					this.logger.error(
+						'Failed to search thread by username (exact)',
+						error,
+					);
+					throw error;
+				}
+
+				return [];
+			}
+		}
+
+		try {
+			const {users} = await this.ig.user.search(username);
+
+			if (!users || users.length === 0) {
+				return [];
+			}
+
+			// Map users to "Threads" packaged in SearchResult
+			const results = users.map(user => {
+				const fullName = user.full_name ? ` (${user.full_name})` : '';
+
+				// Cache user info
+				this.userCache.set(
+					user.pk.toString(),
+					user.username ?? user.full_name ?? `User_${user.pk}`,
+				);
+
+				const thread: Thread = {
+					id: `PENDING_${user.pk}`, // Virtual ID
+					title: `${user.username}${fullName}`,
+					users: [
+						{
+							pk: user.pk.toString(),
+							username: user.username,
+							fullName: user.full_name,
+							profilePicUrl: user.profile_pic_url,
+							isVerified: user.is_verified,
+						},
+					],
+					lastMessage: undefined,
+					lastActivity: new Date(),
+					unread: false,
+				};
+
+				let score = 0; // Default score as per request "assign score = 0"
+
+				const friendshipStatus = user.friendship_status;
+				// Rank: Bestie > Following > Others
+				if (friendshipStatus?.is_bestie) {
+					score = 0.3;
+				} else if (friendshipStatus?.following) {
+					score = 0.2;
+				} else {
+					score = 0.1;
+				}
+
+				return {
+					thread,
+					score,
+				};
+			});
+
+			// Sort by score descending
+			return results.sort((a, b) => b.score - a.score);
+		} catch (error) {
+			this.logger.error('Failed to search thread by username (fuzzy)', error);
+			throw error;
+		}
+	}
+
+	/**
+	 * Ensures a real thread exists for a user participant.
+	 * Resolves a virtual 'PENDING_pk' ID to a real thread ID.
+	 *
+	 * @param userPk - The user PK to create/find a thread with
+	 * @returns The real Thread object
+	 */
+	public async ensureThread(userPk: string | number): Promise<Thread> {
+		try {
+			// Ensure we pass an array of numbers or an array of strings, not mixed
+			const response = await this.ig.directThread.getByParticipants(
+				typeof userPk === 'number' ? [userPk] : [userPk],
+			);
+			const {thread} = response;
+
+			if (!thread) {
+				throw new Error('Thread not found');
+			}
+
+			return {
+				id: thread.thread_id,
+				title: this.getThreadTitle(
+					thread as unknown as DirectInboxFeedResponseThreadsItem,
+				),
+				users: this.getThreadUsers(
+					thread as unknown as DirectInboxFeedResponseThreadsItem,
+				),
+				lastMessage: this.getLastMessage(
+					thread as unknown as DirectInboxFeedResponseThreadsItem,
+				),
+				lastActivity: new Date(Number(thread.last_activity_at) / 1000),
+				unread: (thread as any).read_state === 1,
+			};
+		} catch (error) {
+			this.logger.error('Failed to ensure thread', error);
+			throw error;
+		}
+	}
+
+	/**
+	 * Search threads by title using fuzzy search with Fuse.js.
+	 *
+	 * @param query - The search query for thread titles
+	 * @param options - Search options including threshold (how similar the title must be) and maxThreadsToSearch (how many threads to search)
+	 * @returns A promise that resolves to an array of SearchResult objects with threads and scores
+	 */
+	public async searchThreadsByTitle(
+		query: string,
+		options?: {threshold?: number; maxThreadsToSearch?: number},
+	): Promise<SearchResult[]> {
+		const {threshold = 0.4, maxThreadsToSearch = 40} = options ?? {};
+		try {
+			// Use cached threads if available and not expired
+			const now = Date.now();
+			let isCacheExpired =
+				this.threadsCache.length === 0 ||
+				!this.threadsCacheTimestamp ||
+				now - this.threadsCacheTimestamp > this.threadsCacheTTL;
+			if (isCacheExpired) {
+				this.threadsCache.length = 0;
+			}
+
+			let hasMore = true;
+			while (this.threadsCache.length < maxThreadsToSearch && hasMore) {
+				// eslint-disable-next-line no-await-in-loop
+				const result = await this.getThreads(!isCacheExpired);
+				hasMore = result.hasMore;
+				isCacheExpired = false; // After first fetch, subsequent fetches are loadMore
+				if (!hasMore) {
+					this.logger.debug('No more threads available to fetch');
+					break;
+				}
+			}
+
+			const fuse = new Fuse(this.threadsCache, {
+				keys: ['title'],
+				threshold, // 0 = perfect match, 1 = no match in Fuse
+				includeScore: true,
+			});
+			const fuseResults = fuse.search(query);
+			const searchResults: SearchResult[] = fuseResults.map(result => ({
+				thread: result.item,
+				score: 1 - (result.score ?? 0), // Invert the score
+			}));
+			return searchResults.slice(0, maxThreadsToSearch);
+		} catch (error) {
+			this.logger.error('Failed to search threads by title', error);
+			throw error;
+		}
+	}
+
+	public async getMessages(
+		threadId: string,
+		cursor?: string,
+	): Promise<{messages: Message[]; cursor: string | undefined}> {
+		try {
+			const thread = this.ig.feed.directThread({
+				thread_id: threadId,
+				oldest_cursor: cursor ?? '',
+			});
+			const items = await thread.items();
+			const messages = items
+				.map(item =>
+					// eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+					parseMessageItem(item as any, threadId, {
+						userCache: this.userCache,
+						currentUserId: this.ig.state.cookieUserId,
+					}),
+				)
+				.filter((message): message is Message => message !== undefined);
+
+			return {
+				messages: messages.reverse(),
+				cursor: thread.cursor,
+			};
+		} catch (error) {
+			this.logger.error('Failed to fetch messages', error);
+			throw error;
+		}
+	}
+
+	public async markThreadAsSeen(
+		threadId: string,
+		itemId: string,
+	): Promise<void> {
+		try {
+			await this.ig.entity.directThread(threadId).markItemSeen(itemId);
+		} catch (error) {
+			this.logger.error('Failed to mark item as seen', error);
+			throw error;
+		}
+	}
+
+	public async markItemAsSeen(threadId: string, itemId: string): Promise<void> {
+		if (this.realtimeStatus === 'connected' && this.realtime?.direct) {
+			try {
+				await this.realtime.direct.markAsSeen({threadId, itemId});
+			} catch {
+				this.logger.warn('MQTT mark as seen failed, falling back to API.');
+			}
+		}
+	}
+
+	public async sendMessage(threadId: string, text: string): Promise<string> {
+		// if (this.realtimeStatus === 'connected' && this.realtime?.direct) {
+		// 	try {
+		// 		await this.realtime.direct.sendText({threadId, text});
+		// 		return;
+		// 	} catch {
+		// 		this.logger.warn('MQTT sendMessage failed, falling back to API.');
+		// 	}
+		// }
+
+		// Fallback to API if MQTT not available, failed, or not ready
+		try {
+			const result = await this.ig.entity
+				.directThread(threadId)
+				.broadcastText(text);
+			return extractItemId(result);
+		} catch (error) {
+			this.logger.error('Failed to send message', error);
+			throw error;
+		}
+	}
+
+	public async sendReply(
+		threadId: string,
+		text: string,
+		replyToMessage: Message,
+	): Promise<string> {
+		try {
+			const result = await this.ig.entity
+				.directThread(threadId)
+				// The API only requires item_id and client_context which are already present
+				.broadcastText(
+					text,
+					replyToMessage as unknown as DirectThreadFeedResponseItemsItem,
+				);
+			return extractItemId(result);
+		} catch (error) {
+			this.logger.error('Failed to send reply', error);
+			throw error;
+		}
+	}
+
+	public async sendReaction(
+		threadId: string,
+		itemId: string,
+		emoji: string,
+	): Promise<void> {
+		if (this.realtimeStatus === 'connected' && this.realtime) {
+			try {
+				await this.realtime.direct?.sendReaction({
+					threadId,
+					itemId,
+					emoji,
+					reactionStatus: 'created',
+				});
+			} catch (error) {
+				this.logger.warn('MQTT sendReaction failed.');
+				throw error;
+			}
+		} else {
+			throw new Error('Real-time client not connected. Cannot send reaction.');
+		}
+	}
+
+	public async sendPhoto(threadId: string, filePath: string): Promise<string> {
+		try {
+			const fileBuffer = await fs.promises.readFile(filePath);
+			const result = await this.ig.entity
+				.directThread(threadId)
+				.broadcastPhoto({
+					file: fileBuffer,
+				});
+			return extractItemId(result);
+		} catch (error) {
+			this.logger.error('Failed to send photo', error);
+			throw error;
+		}
+	}
+
+	public async sendVideo(threadId: string, filePath: string): Promise<string> {
+		try {
+			const fileBuffer = await fs.promises.readFile(filePath);
+			const result = await this.ig.entity
+				.directThread(threadId)
+				.broadcastVideo({
+					video: fileBuffer,
+				});
+			return extractItemId(result);
+		} catch (error) {
+			this.logger.error('Failed to send video', error);
+			throw error;
+		}
+	}
+
+	public async unsendMessage(
+		threadId: string,
+		messageId: string,
+	): Promise<void> {
+		try {
+			await this.ig.entity.directThread(threadId).deleteItem(messageId);
+		} catch (error) {
+			this.logger.error('Failed to unsend message', error);
+			throw error;
+		}
+	}
+
+	public async downloadMedia(
+		_mediaId: string,
+		mediaUrl: string,
+		downloadPath: string,
+	): Promise<string> {
+		try {
+			const response = await fetch(mediaUrl);
+
+			if (!response.ok) {
+				throw new Error(
+					`Failed to download media: ${response.status} ${response.statusText}`,
+				);
+			}
+
+			if (!response.body) {
+				throw new Error('Response body is empty');
+			}
+
+			await pipeline(
+				Readable.fromWeb(response.body),
+				fs.createWriteStream(downloadPath),
+			);
+
+			return downloadPath;
+		} catch (error) {
+			this.logger.error('Failed to download media', error);
+			throw error;
+		}
+	}
+
+	public async downloadMediaFromMessage(
+		message: Message,
+		downloadPath: string,
+	): Promise<string> {
+		if (message.itemType !== 'media' || !message.media) {
+			throw new Error('Message does not contain media');
+		}
+
+		// Determine the best media URL based on media type
+		const result = getBestMediaUrl(message.media);
+		const mediaUrl = result?.url;
+		const mediaType = result?.type;
+
+		if (!mediaUrl) {
+			throw new Error('No media URL found in message');
+		}
+
+		// If the download path has no extension, add the appropriate one based on media type
+		let finalDownloadPath = downloadPath;
+		if (mediaType) {
+			const hasExtension = extname(downloadPath) !== '';
+			if (!hasExtension) {
+				const extension = mediaType === 'image' ? '.jpg' : '.mp4';
+				finalDownloadPath = downloadPath + extension;
+			}
+		}
+
+		return this.downloadMedia(message.media.id, mediaUrl, finalDownloadPath);
+	}
+
+	/**
+	 * Fetches the reels tray, which contains a list of users who have active stories.
+	 *
+	 * @returns A promise that resolves to an array of `ListMediaItem<Story>` objects, each with user info but an empty `content` array.
+	 */
+	public async getReelsTray(): Promise<Array<ListMediaItem<Story>>> {
+		try {
+			const ig = this.getInstagramClient();
+			// If first time, use cold_start (not documented, this is a guess...)
+			const reelsTrayFeed = ig.feed.reelsTray(
+				this.hasInitializedReelsTray ? 'pull_to_refresh' : 'cold_start',
+			);
+			const reelsTrayItems = await reelsTrayFeed.items();
+			this.hasInitializedReelsTray = true;
+
+			if (!Array.isArray(reelsTrayItems) || reelsTrayItems.length === 0) {
+				this.logger.warn('No users with active stories found in reels tray.');
+				return [];
+			}
+
+			this.logger.info(
+				`Found ${reelsTrayItems.length} users with active stories.`,
+			);
+
+			const storyReels: Array<ListMediaItem<Story>> = reelsTrayItems
+				.filter(
+					(item): item is ReelsTrayFeedResponseTrayItem =>
+						item.user !== undefined,
+				)
+				.map(item => ({
+					pk: String(item.user.pk),
+					label: item.user.username ?? `User_${item.user.pk}`,
+					content: [], // Stories will be lazy-loaded
+				}));
+
+			return storyReels;
+		} catch (error) {
+			this.logger.error('Failed to fetch reels tray', error);
+			throw error;
+		}
+	}
+
+	/**
+	 * Fetch stories for a specific user by ID (with caching).
+	 *
+	 * @param userId - The user ID to fetch stories for
+	 * @param userName - If provided, search for the user id by username first
+	 * @returns A promise that resolves to an array of Story objects
+	 */
+	public async getStoriesForUser(
+		userId?: number | string,
+		userName?: string,
+	): Promise<Story[]> {
+		try {
+			// If username is provided, resolve to user ID first
+			if (userName) {
+				const userInfo = await this.ig.user.searchExact(userName);
+				userId = userInfo.pk;
+			}
+
+			if (!userId) {
+				throw new Error('Either userId or userName must be provided');
+			}
+
+			const userIdNum = typeof userId === 'string' ? Number(userId) : userId;
+
+			// Return cached stories if available
+			if (this.loadedStoriesMap.has(userIdNum)) {
+				this.logger.debug(`Returning cached stories for user ${userId}`);
+				const cachedStories = this.loadedStoriesMap.get(userIdNum);
+				return cachedStories ?? [];
+			}
+
+			const ig = this.getInstagramClient();
+			const userStoryFeed = ig.feed.userStory(userIdNum);
+			const storyItems = await userStoryFeed.items();
+
+			const stories: Story[] = (Array.isArray(storyItems) ? storyItems : [])
+				.map(item => this.mapStoryItem(item))
+				.filter((s): s is Story => s !== undefined);
+
+			// Cache the stories
+			this.loadedStoriesMap.set(userIdNum, stories);
+
+			this.logger.debug(
+				`Fetched and cached ${stories.length} stories for user ${userId}`,
+			);
+
+			return stories;
+		} catch (error) {
+			this.logger.error(`Failed to fetch stories for user ${userId}:`, error);
+			throw error;
+		}
+	}
+
+	/**
+	 * Marks a batch of stories as seen.
+	 * @param stories - An array of story items from the same user to be marked as seen.
+	 */
+	public async markStoriesAsSeen(stories: Story[]): Promise<void> {
+		if (stories.length === 0) {
+			return;
+		}
+
+		try {
+			// See example code, this refers to source user ID and time taken
+			await this.ig.story.seen(stories);
+			this.logger.debug(
+				`Marked ${stories.length} stories as seen for user ${stories[0]?.user?.pk}`,
+			);
+		} catch (error) {
+			this.logger.error(
+				`Failed to mark stories as seen for user ${stories[0]?.user?.pk}`,
+				error,
+			);
+		}
+	}
+
+	private setRealtimeStatus(status: RealtimeStatus) {
+		this.realtimeStatus = status;
+		this.emit('realtimeStatus', status);
+	}
+
+	private async initializeRealtime(): Promise<void> {
+		this.setRealtimeStatus('connecting');
+		this.realtime = withRealtime(this.ig).realtime;
+
+		this.realtime.on('error', error => {
+			this.logger.error('Realtime Error', error);
+			this.setRealtimeStatus('error');
+			this.emit('error', error);
+		});
+
+		this.realtime.on('close', () => {
+			this.setRealtimeStatus('disconnected');
+		});
+
+		this.realtime.on('message', (wrapper: any) => {
+			this.logger.debug(`Received MQTT "message": ${JSON.stringify(wrapper)}`);
+			// Handle reaction events
+			if (
+				wrapper.delta_type === 'deltaCreateReaction' &&
+				wrapper.message?.action_type !== 'action_log'
+			) {
+				// eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+				const reactionData = parseReactionEvent(wrapper.message);
+				if (reactionData) {
+					this.emit('reaction', reactionData);
+				} else {
+					this.logger.warn(
+						`Failed to parse realtime reaction event: ${JSON.stringify(wrapper)}`,
+					);
+				}
+			} else if (wrapper.delta_type === 'deltaNewMessage') {
+				// Handle regular message events
+				// ThreadId must exist otherwise it's not possible to identify where this event belongs
+
+				const threadId =
+					wrapper?.message?.thread_id ?? wrapper?.message?.thread_v2_id;
+				if (!threadId) return;
+
+				// eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+				const parsedMessage = parseMessageItem(wrapper.message, threadId, {
+					userCache: this.userCache,
+					currentUserId: this.ig.state.cookieUserId,
+				});
+				if (parsedMessage) {
+					this.emit('message', parsedMessage);
+				}
+			} else if (wrapper.delta_type === 'deltaReadReceipt') {
+				// Handle read receipt events
+				// eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+				const seenData = parseSeenEvent(wrapper.message);
+				const currentUserId = this.ig.state.cookieUserId;
+				if (
+					seenData?.threadId &&
+					seenData?.userId &&
+					currentUserId !== seenData.userId
+				) {
+					this.emit('threadSeen', seenData);
+				}
+			}
+		});
+
+		await this.realtime.connect({
+			graphQlSubs: [
+				GraphQLSubscriptions.getAppPresenceSubscription(),
+				GraphQLSubscriptions.getZeroProvisionSubscription(
+					this.ig.state.phoneId,
+				),
+				GraphQLSubscriptions.getDirectStatusSubscription(),
+				GraphQLSubscriptions.getDirectTypingSubscription(
+					this.ig.state.cookieUserId,
+				),
+				GraphQLSubscriptions.getAsyncAdSubscription(this.ig.state.cookieUserId),
+			],
+			skywalkerSubs: [
+				SkywalkerSubscriptions.directSub(this.ig.state.cookieUserId),
+				SkywalkerSubscriptions.liveSub(this.ig.state.cookieUserId),
+			],
+			irisData: await this.ig.feed.directInbox().request(),
+		});
+
+		this.setRealtimeStatus('connected');
+	}
+
+	private async saveSessionState(): Promise<void> {
+		if (!this.sessionManager) {
+			return;
+		}
+
+		try {
+			const serialized = await this.ig.state.serialize();
+			// eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+			await this.sessionManager.saveSession(serialized);
+		} catch (error) {
+			this.logger.error('Error saving session state', error);
+		}
+	}
+
+	private getThreadTitle(thread: DirectInboxFeedResponseThreadsItem): string {
+		if (thread.thread_title) {
+			return thread.thread_title;
+		}
+
+		const users = thread.users || [];
+		const otherUsers = users.filter(
+			(user: DirectInboxFeedResponseUsersItem) =>
+				user.pk.toString() !== this.ig.state.cookieUserId,
+		);
+
+		if (otherUsers.length === 0) {
+			return 'You';
+		}
+
+		if (otherUsers.length === 1) {
+			return (
+				otherUsers[0]?.username ?? otherUsers[0]?.full_name ?? 'Unknown User'
+			);
+		}
+
+		return otherUsers
+			.map(
+				(user: DirectInboxFeedResponseUsersItem) =>
+					user.username || user.full_name,
+			)
+			.join(', ');
+	}
+
+	private getThreadUsers(thread: DirectInboxFeedResponseThreadsItem): User[] {
+		const users = thread.users || [];
+		return users.map((user: DirectInboxFeedResponseUsersItem) => ({
+			pk: user.pk.toString(),
+			username: user.username || '',
+			fullName: user.full_name || '',
+			profilePicUrl: user.profile_pic_url,
+			isVerified: user.is_verified || false,
+		}));
+	}
+
+	private getLastMessage(
+		thread: DirectInboxFeedResponseThreadsItem,
+	): Message | undefined {
+		const items = thread.items || [];
+		const lastItem = items[0];
+
+		if (!lastItem) {
+			return undefined;
+		}
+
+		return parseMessageItem(
+			// eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+			lastItem as any,
+			thread.thread_id,
+			{
+				userCache: this.userCache,
+				currentUserId: this.ig.state.cookieUserId,
+			},
+			{
+				isPreview: true,
+			},
+		);
+	}
+
+	private mapStoryItem(
+		item: UserStoryFeedResponseItemsItem,
+	): Story | undefined {
+		if (!item?.user) {
+			// item.user can be missing on some story items
+			return undefined;
+		}
+
+		return {
+			id: item.id,
+			media_type: item.media_type,
+			taken_at: item.taken_at,
+			user: {
+				pk: item.user.pk,
+				username: item.user.username,
+				profilePicUrl: item.user.profile_pic_url,
+			},
+			// We validated that this field exists on the returned object
+			// eslint-disable-next-line @typescript-eslint/no-unsafe-call
+			reel_mentions: (item as any).reel_mentions?.map((mention: any) => {
+				const {user} = mention;
+				return {
+					user: {
+						pk: user.pk as number,
+						username: user.username as string,
+						full_name: user.full_name as string,
+						profile_pic_url: user.profile_pic_url as string,
+					},
+				};
+			}),
+			image_versions2: item.image_versions2,
+			video_versions: item.video_versions,
+		};
+	}
+
+	/**
+	 * Emulate app behavior before login.
+	 *
+	 * @remarks This is ported from instagrapi and is NOT the same as client.simulate.preLoginFlow() from instagram-private-api.
+	 *
+	 */
+	private async preLoginFlow(): Promise<boolean> {
+		try {
+			await this.ig.launcher.preLoginSync();
+			return true;
+		} catch (error) {
+			this.logger.error('Pre login flow failed', error);
+			return false;
+		}
+	}
+
+	/**
+	 * Emulate app behavior after login.
+	 *
+	 * @remarks This is ported from instagrapi and is NOT the same as client.simulate.postLoginFlow() from instagram-private-api.
+	 */
+	private async postLoginFlow(): Promise<boolean> {
+		try {
+			await this.ig.feed.reelsTray('cold_start').request();
+			this.hasInitializedReelsTray = true;
+			await this.ig.feed.timeline('cold_start_fetch').request();
+			return true;
+		} catch (error) {
+			this.logger.error('Post login flow failed', error);
+			return false;
+		}
+	}
+
+	private async postLoginSetup(
+		username: string,
+		options: {
+			initializeRealtime?: boolean;
+		},
+	): Promise<void> {
+		const originalUsername = username;
+		const {initializeRealtime = true} = options;
+
+		await this.saveSessionState();
+
+		// Use the original username to maintain consistency with session file paths
+		// Instagram API may return username in different casing (usually lowercase)
+		await this.configManager.set('login.currentUsername', originalUsername);
+		this.username = originalUsername.toLowerCase();
+
+		const defaultUsername = this.configManager.get('login.defaultUsername');
+		if (!defaultUsername) {
+			await this.configManager.set('login.defaultUsername', originalUsername);
+		}
+
+		// Run post-login setup tasks in parallel to speed up initialization
+		await Promise.all([
+			(async () => {
+				if (initializeRealtime) {
+					try {
+						await this.initializeRealtime();
+					} catch (error) {
+						this.setRealtimeStatus('error');
+						this.emit(
+							'error',
+							new Error(
+								`Realtime connection failed: ${(error as Error).message}`,
+							),
+						);
+					}
+				}
+			})(),
+			(async () => {
+				if (!this.loginFlowStates.postLoginDone) {
+					await this.postLoginFlow();
+					// Continue even if postLoginFlow fails
+					this.loginFlowStates.postLoginDone = true;
+				}
+			})(),
+		]);
+	}
+}

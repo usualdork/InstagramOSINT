@@ -1,0 +1,115 @@
+{
+	"name": "igosint",
+	"description": "Instagram OSINT — Intelligence, analysis, and data export toolkit for Instagram",
+	"version": "1.0.0",
+	"license": "MIT",
+	"keywords": [
+		"instagram",
+		"osint",
+		"intelligence",
+		"cli",
+		"terminal",
+		"analysis",
+		"social-media",
+		"scraping",
+		"export",
+		"engagement",
+		"followers",
+		"typescript",
+		"react",
+		"ink"
+	],
+	"bin": {
+		"igosint": "dist/cli.js"
+	},
+	"type": "module",
+	"engines": {
+		"node": ">=22"
+	},
+	"scripts": {
+		"format": "prettier --write .",
+		"build": "tsc --noEmit && node esbuild.config.mjs --production",
+		"clean": "rm -rf dist",
+		"lint-check": "prettier --check . && xo --ignore esbuild.config.mjs",
+		"prepare": "husky",
+		"dev": "node esbuild.config.mjs",
+		"dev:watch": "node esbuild.config.mjs --watch",
+		"start": "node dist/cli.js",
+		"start:mock": "node dist/mocks/cli.mock.js",
+		"test": "prettier --check . && xo --ignore esbuild.config.mjs && ava",
+		"postinstall": "patch-package"
+	},
+	"files": [
+		"dist",
+		"patches"
+	],
+	"dependencies": {
+		"@inkjs/ui": "^2.0.0",
+		"debug": "^4.4.3",
+		"emoji-name-map": "^2.0.3",
+		"file-type": "^22.0.1",
+		"fuse.js": "^7.1.0",
+		"ink": "^7.0.0",
+		"ink-big-text": "^2.0.0",
+		"ink-gradient": "^3.0.0",
+		"ink-picture": "^2.0.1",
+		"ink-testing-library": "^4.0.0",
+		"instagram_mqtt": "^1.2.3",
+		"instagram-private-api": "^1.46.1",
+		"js-yaml": "^4.1.0",
+		"meow": "^14.0.0",
+		"open": "^11.0.0",
+		"openai": "^6.45.0",
+		"pastel": "^4.0.0",
+		"patch-package": "^8.0.1",
+		"react": "^19.2.0",
+		"read-package-up": "^12.0.0",
+		"string-width": "^8.2.0",
+		"unicode-emoji-json": "^0.9.0",
+		"wrap-ansi": "^10.0.0",
+		"zod": "^4.1.0"
+	},
+	"devDependencies": {
+		"@sindresorhus/tsconfig": "^8.1.0",
+		"@types/debug": "^4.1.12",
+		"@types/js-yaml": "^4.0.9",
+		"@types/react": "^19.2.0",
+		"@vdemedes/prettier-config": "^2.0.1",
+		"ava": "^7.0.0",
+		"chalk": "^5.2.0",
+		"csv-parse": "^7.0.1",
+		"esbuild": "^0.28.0",
+		"eslint-config-xo-react": "^0.29.0",
+		"eslint-plugin-react": "^7.37.5",
+		"eslint-plugin-react-hooks": "^7.0.1",
+		"fast-check": "^4.8.0",
+		"husky": "^9.1.7",
+		"lint-staged": "^16.2.7",
+		"prettier": "^3.3.3",
+		"ts-node": "^10.9.2",
+		"typescript": "^5.0.3",
+		"xo": "^2.0.1"
+	},
+	"ava": {
+		"files": [
+			"tests/**"
+		],
+		"extensions": {
+			"ts": "module",
+			"tsx": "module"
+		},
+		"nodeArguments": [
+			"--loader=ts-node/esm"
+		]
+	},
+	"prettier": "@vdemedes/prettier-config",
+	"lint-staged": {
+		"**/*.{ts,tsx,js,jsx,json,md}": "prettier --write",
+		"**/*.{ts,tsx}": "xo --ignore esbuild.config.mjs"
+	},
+	"overrides": {
+		"form-data": "^4.0.0",
+		"qs": "^6.14.1",
+		"tough-cookie": "^5.1.0"
+	}
+}

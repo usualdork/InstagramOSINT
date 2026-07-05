@@ -1,0 +1,122 @@
+import React from 'react';
+import {Box, Text} from 'ink';
+import Image from 'ink-picture';
+import type {Message, Thread} from '../../types/instagram.js';
+import {useImageProtocol} from '../hooks/use-image-protocol.js';
+
+type ThreadItemProperties = {
+	readonly thread: Thread;
+	readonly isSelected: boolean;
+	readonly isHovered: boolean;
+};
+
+export default function ThreadItem({
+	thread,
+	isSelected,
+	isHovered,
+}: ThreadItemProperties) {
+	const imageProtocol = useImageProtocol();
+	const formatTime = (date: Date) => {
+		const now = new Date();
+		const diff = now.getTime() - date.getTime();
+		const minutes = Math.floor(diff / 60_000);
+
+		if (minutes < 60) {
+			return `${minutes}m`;
+		}
+
+		const hours = Math.floor(minutes / 60);
+		if (hours < 24) {
+			return `${hours}h`;
+		}
+
+		const days = Math.floor(hours / 24);
+		return `${days}d`;
+	};
+
+	const getLastMessageText = (message: Message): string => {
+		switch (message.itemType) {
+			case 'text': {
+				return message.text;
+			}
+
+			case 'media': {
+				return '[Media]';
+			}
+
+			case 'media_share': {
+				return `[Shared post by @${message.mediaSharePost.user.username}]`;
+			}
+
+			case 'link': {
+				return message.link.text;
+			}
+
+			case 'placeholder': {
+				return message.text;
+			}
+
+			default: {
+				return '[Unsupported Message]';
+			}
+		}
+	};
+
+	const lastMessageText = thread.lastMessage
+		? getLastMessageText(thread.lastMessage)
+		: '';
+
+	const threadAvatar = thread.users[0]?.profilePicUrl;
+
+	return (
+		<Box
+			paddingX={1}
+			paddingY={1}
+			width="100%"
+			flexDirection="row"
+			backgroundColor={isSelected ? '#3a3a3a' : isHovered ? 'gray' : undefined}
+		>
+			{threadAvatar && (
+				<Box marginRight={1}>
+					<Image
+						src={threadAvatar}
+						width={4}
+						height={2}
+						protocol={{full: imageProtocol}}
+					/>
+				</Box>
+			)}
+			<Box flexDirection="column">
+				{/* Top Row: Title, Unread, Time */}
+				<Box justifyContent="space-between">
+					<Box flexShrink={1} marginRight={2}>
+						<Text
+							bold={isSelected}
+							color={isSelected ? 'cyan' : undefined}
+							wrap="truncate"
+						>
+							{thread.title}
+						</Text>
+					</Box>
+					<Box>
+						{thread.unread && (
+							<Text bold color="green">
+								●{' '}
+							</Text>
+						)}
+						<Text dimColor>{formatTime(thread.lastActivity)}</Text>
+					</Box>
+				</Box>
+
+				{/* Bottom Row: Last Message */}
+				{lastMessageText && (
+					<Box>
+						<Text dimColor wrap="truncate">
+							{lastMessageText.replaceAll(/[\n\r]+/g, ' ')}
+						</Text>
+					</Box>
+				)}
+			</Box>
+		</Box>
+	);
+}

@@ -1,0 +1,53 @@
+import {rmSync} from 'node:fs';
+import {parseArgs} from 'node:util';
+import * as esbuild from 'esbuild';
+
+const {values} = parseArgs({
+	options: {
+		production: {
+			type: 'boolean',
+			short: 'p',
+		},
+		watch: {
+			type: 'boolean',
+			short: 'w',
+		},
+	},
+});
+
+if (values.production) {
+	rmSync('dist', {recursive: true, force: true});
+}
+
+async function runBuild() {
+	const entryPoints = ['source/cli.ts', 'source/commands/**/*.tsx'];
+
+	// Include mocks if not production
+	if (!values.production) {
+		entryPoints.push('source/mocks/cli.mock.ts');
+	}
+
+	const buildOptions = {
+		entryPoints,
+		bundle: true,
+		splitting: true,
+		platform: 'node',
+		format: 'esm',
+		outdir: 'dist',
+		outbase: 'source',
+		minify: values.production,
+		packages: 'external',
+		external: ['react-devtools-core'],
+	};
+
+	if (values.watch) {
+		const ctx = await esbuild.context(buildOptions);
+		await ctx.watch();
+		console.log('Watching for changes...');
+	} else {
+		await esbuild.build(buildOptions);
+		console.log('Build complete!');
+	}
+}
+
+await runBuild();

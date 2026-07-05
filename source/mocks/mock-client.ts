@@ -1,0 +1,597 @@
+import {extname} from 'node:path';
+import {EventEmitter} from 'node:events';
+import Fuse from 'fuse.js';
+import type {
+	InstagramClient,
+	LoginResult,
+	RealtimeStatus,
+	SearchResult,
+} from '../client.js';
+import type {
+	Thread,
+	Message,
+	User,
+	Story,
+	ListMediaItem,
+	ProfileInfo,
+} from '../types/instagram.js';
+import {createContextualLogger} from '../utils/logger.js';
+import {
+	mockMessages,
+	generateThreads,
+	mockStories,
+	mockUsers,
+} from './mock-data.js';
+
+const logger = createContextualLogger('MockClient');
+
+// eslint-disable-next-line unicorn/prefer-event-target
+class MockClient extends EventEmitter {
+	// Static cleanup methods
+	static async cleanupSessions(): Promise<void> {
+		logger.info('Mock: Sessions cleaned up');
+	}
+
+	static async cleanupCache(): Promise<void> {
+		logger.info('Mock: Cache cleaned up');
+	}
+
+	private readonly threads: Thread[] = generateThreads(50);
+	private threadsPage = 0;
+	private readonly sentMessages: Message[] = [];
+
+	private readonly sentReactions = new Map<
+		string,
+		Array<{emoji: string; senderId: string}>
+	>();
+
+	private get realtimeStatus(): RealtimeStatus {
+		return 'disconnected';
+	}
+
+	async getThreads(
+		loadMore = false,
+	): Promise<{threads: Thread[]; hasMore: boolean}> {
+		// Simulate network delay
+		await new Promise(resolve => {
+			setTimeout(resolve, 1000);
+		});
+		const threads_per_page = 20;
+		if (!loadMore) {
+			this.threadsPage = 0;
+		}
+
+		const threads = this.threads.slice(
+			this.threadsPage * threads_per_page,
+			(this.threadsPage + 1) * threads_per_page,
+		);
+		const hasMore =
+			(this.threadsPage + 1) * threads_per_page < this.threads.length;
+		this.threadsPage += 1;
+		return {threads, hasMore};
+	}
+
+	async getMessages(
+		// @ts-expect-error: cursor is not used in mock
+		threadId: string,
+		_cursor?: string,
+	): Promise<{
+		messages: Message[];
+		cursor: string | undefined;
+	}> {
+		// Filter messages for the specific thread
+		const threadMessages = [
+			// ...mockMessages.filter(message => message.threadId === threadId),
+			// ...this.sentMessages.filter(message => message.threadId === threadId),
+			...mockMessages,
+			...this.sentMessages,
+		].sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+
+		// Add mock reactions to messages
+		const messagesWithReactions = threadMessages.map(message => {
+			const additionalReactions = this.sentReactions.get(message.id);
+			if (additionalReactions) {
+				return {
+					...message,
+					reactions: [...(message.reactions ?? []), ...additionalReactions],
+				};
+			}
+
+			return message;
+		});
+
+		return {
+			messages: messagesWithReactions,
+			cursor: undefined, // No pagination for mocks
+		};
+	}
+
+	async sendMessage(threadId: string, text: string): Promise<void> {
+		// Simulate sending a message
+		const newMessage: Message = {
+			id: `sent_${Date.now()}`,
+			timestamp: new Date(),
+			userId: 'current_user',
+			username: 'current_user',
+			isOutgoing: true,
+			threadId,
+			itemType: 'text',
+			text,
+		};
+
+		this.sentMessages.push(newMessage);
+
+		// Simulate network delay
+		await new Promise(resolve => {
+			setTimeout(resolve, 100);
+		});
+
+		// Emit the message event to simulate realtime
+		this.emit('message', newMessage);
+	}
+
+	async sendReaction(
+		threadId: string,
+		itemId: string,
+		emoji: string,
+	): Promise<void> {
+		// Simulate sending a reaction
+		const reaction = {
+			emoji,
+			senderId: 'current_user',
+		};
+
+		const existingReactions = this.sentReactions.get(itemId) ?? [];
+		this.sentReactions.set(itemId, [...existingReactions, reaction]);
+
+		// Simulate network delay
+		await new Promise(resolve => {
+			setTimeout(resolve, 50);
+		});
+
+		logger.info(
+			`Mock: Added reaction ${emoji} to message ${itemId} in thread ${threadId}`,
+		);
+	}
+
+	async sendReply(
+		threadId: string,
+		text: string,
+		replyToMessage: Message,
+	): Promise<void> {
+		// Simulate sending a reply
+		const newMessage: Message = {
+			id: `reply_${Date.now()}`,
+			timestamp: new Date(),
+			userId: 'current_user',
+			username: 'current_user',
+			isOutgoing: true,
+			threadId,
+			itemType: 'text',
+			text,
+			repliedTo: {
+				id: replyToMessage.id,
+				userId: replyToMessage.userId,
+				username: replyToMessage.username,
+				text:
+					replyToMessage.itemType === 'text'
+						? replyToMessage.text
+						: replyToMessage.itemType === 'link'
+							? replyToMessage.link.text
+							: replyToMessage.itemType === 'media'
+								? '[Media]'
+								: '[Unsupported Media]',
+				itemType: replyToMessage.itemType,
+			},
+		};
+
+		this.sentMessages.push(newMessage);
+		await new Promise(resolve => {
+			setTimeout(resolve, 150);
+		});
+		this.emit('message', newMessage);
+	}
+
+	async sendPhoto(threadId: string, filePath: string): Promise<void> {
+		// Simulate sending a photo
+		const newMessage: Message = {
+			id: `photo_${Date.now()}`,
+			timestamp: new Date(),
+			userId: 'current_user',
+			username: 'current_user',
+			isOutgoing: true,
+			threadId,
+			itemType: 'media',
+			media: {
+				id: `media_${Date.now()}`,
+				media_type: 1, // Image
+				image_versions2: {
+					candidates: [
+						{
+							url: filePath,
+							width: 1080,
+							height: 1080,
+						},
+					],
+				},
+				original_width: 1080,
+				original_height: 1080,
+			},
+		};
+
+		this.sentMessages.push(newMessage);
+		await new Promise(resolve => {
+			setTimeout(resolve, 200);
+		});
+		this.emit('message', newMessage);
+	}
+
+	async sendVideo(threadId: string, filePath: string): Promise<void> {
+		// Simulate sending a video
+		const newMessage: Message = {
+			id: `video_${Date.now()}`,
+			timestamp: new Date(),
+			userId: 'current_user',
+			username: 'current_user',
+			isOutgoing: true,
+			threadId,
+			itemType: 'media',
+			media: {
+				id: `media_${Date.now()}`,
+				media_type: 2, // Video
+				video_versions: [
+					{
+						url: filePath,
+						width: 1080,
+						height: 1920,
+					},
+				],
+				original_width: 1080,
+				original_height: 1920,
+			},
+		};
+
+		this.sentMessages.push(newMessage);
+		await new Promise(resolve => {
+			setTimeout(resolve, 300);
+		});
+		this.emit('message', newMessage);
+	}
+
+	async unsendMessage(threadId: string, messageId: string): Promise<void> {
+		// Remove from sent messages
+		const messageIndex = this.sentMessages.findIndex(
+			msg => msg.id === messageId,
+		);
+		if (messageIndex !== -1) {
+			this.sentMessages.splice(messageIndex, 1);
+		}
+
+		// Remove any reactions for this message
+		this.sentReactions.delete(messageId);
+
+		await new Promise(resolve => {
+			setTimeout(resolve, 100);
+		});
+		logger.info(`Mock: Unsent message ${messageId} from thread ${threadId}`);
+	}
+
+	async markThreadAsSeen(threadId: string): Promise<void> {
+		// Simulate marking a thread as seen
+		await new Promise(resolve => {
+			setTimeout(resolve, 50);
+		});
+		logger.info(`Mock: Marked thread ${threadId} as seen`);
+	}
+
+	async downloadMedia(
+		_mediaId: string,
+		mediaUrl: string,
+		downloadPath: string,
+	): Promise<string> {
+		// Simulate network delay
+		await new Promise(resolve => {
+			setTimeout(resolve, 100);
+		});
+		logger.info(
+			`Mock: Downloading media from ${mediaUrl} to ${downloadPath}...`,
+		);
+		return downloadPath;
+	}
+
+	async downloadMediaFromMessage(
+		message: Message,
+		downloadPath: string,
+	): Promise<string> {
+		if (message.itemType !== 'media' || !message.media) {
+			throw new Error('Message does not contain media');
+		}
+
+		let mediaUrl: string | undefined;
+		let mediaType: 'image' | 'video' | undefined;
+
+		if (message.media.media_type === 2) {
+			mediaType = 'video';
+			mediaUrl = message.media.video_versions?.[0]?.url;
+		} else if (message.media.media_type === 1) {
+			mediaType = 'image';
+			mediaUrl = message.media.image_versions2?.candidates[0]?.url;
+		}
+
+		if (!mediaUrl) {
+			throw new Error('No media URL found in message');
+		}
+
+		let finalDownloadPath = downloadPath;
+		if (mediaType) {
+			const hasExtension = extname(downloadPath) !== '';
+			if (!hasExtension) {
+				const extension = mediaType === 'image' ? '.jpg' : '.mp4';
+				finalDownloadPath = downloadPath + extension;
+			}
+		}
+
+		return this.downloadMedia(message.media.id, mediaUrl, finalDownloadPath);
+	}
+
+	async markItemAsSeen(threadId: string, itemId: string): Promise<void> {
+		// Simulate marking a message as seen
+		await new Promise(resolve => {
+			setTimeout(resolve, 50);
+		});
+		logger.info(`Mock: Marked item ${itemId} as seen in thread ${threadId}`);
+	}
+
+	async searchThreadByUsername(
+		username: string,
+		_options?: {useExact?: boolean},
+	): Promise<SearchResult[]> {
+		// Simulate network delay
+		await new Promise(resolve => {
+			setTimeout(resolve, 300);
+		});
+
+		const query = username.toLowerCase();
+		const results = mockUsers
+			.filter(
+				user =>
+					user.username.toLowerCase().includes(query) ||
+					user.fullName?.toLowerCase().includes(query),
+			)
+			.map(user => {
+				const fullName = user.fullName ? ` (${user.fullName})` : '';
+				const thread: Thread = {
+					id: `PENDING_${user.pk}`,
+					title: `${user.username}${fullName}`,
+					users: [user],
+					lastActivity: new Date(),
+					unread: false,
+				};
+
+				return {
+					thread,
+					score: 0.5, // Dummy score
+				};
+			});
+
+		return results;
+	}
+
+	async ensureThread(userPk: string | number): Promise<Thread> {
+		const pendingId = `PENDING_${userPk}`;
+		const existingThread = this.threads.find(
+			t => t.id === String(userPk) || t.id === pendingId,
+		);
+
+		if (existingThread) {
+			return existingThread;
+		}
+
+		// Simulate finding user and creating a thread
+		const user = mockUsers.find(u => String(u.pk) === String(userPk));
+		if (!user) {
+			throw new Error('User not found');
+		}
+
+		const newThread: Thread = {
+			id: String(userPk),
+			title: user.fullName || user.username,
+			users: [user],
+			lastActivity: new Date(),
+			unread: false,
+		};
+
+		this.threads.push(newThread);
+		return newThread;
+	}
+
+	async searchThreadsByTitle(
+		query: string,
+		options?: {threshold?: number; maxThreadsToSearch?: number},
+	): Promise<SearchResult[]> {
+		const {threshold = 0.4, maxThreadsToSearch = 40} = options ?? {};
+
+		// Simulate network delay
+		await new Promise(resolve => {
+			setTimeout(resolve, 200);
+		});
+
+		const fuse = new Fuse(this.threads, {
+			keys: ['title'],
+			threshold,
+			includeScore: true,
+		});
+
+		const fuseResults = fuse.search(query);
+		const searchResults: SearchResult[] = fuseResults.map(result => ({
+			thread: result.item,
+			score: 1 - (result.score ?? 0),
+		}));
+
+		return searchResults.slice(0, maxThreadsToSearch);
+	}
+
+	async getCurrentUser(): Promise<User | undefined> {
+		return {
+			pk: 'current_user_id',
+			username: 'mock_user',
+			fullName: 'Mock User',
+			profilePicUrl: 'https://via.placeholder.com/150',
+			isVerified: false,
+		};
+	}
+
+	async getUserProfile(username: string): Promise<ProfileInfo> {
+		await new Promise(resolve => {
+			setTimeout(resolve, 300);
+		});
+		return {
+			pk: '12345',
+			username,
+			fullName: 'Mock Profile User',
+			profilePicUrl: 'https://via.placeholder.com/150',
+			isVerified: true,
+			isPrivate: false,
+			biography: 'Mock bio for testing. Building cool things in the terminal.',
+			followerCount: 12_500,
+			followingCount: 843,
+			mediaCount: 127,
+			externalUrl: 'https://example.com',
+		};
+	}
+
+	async getReelsTray(): Promise<Array<ListMediaItem<Story>>> {
+		// Simulate network delay
+		await new Promise(resolve => {
+			setTimeout(resolve, 100);
+		});
+
+		const usersWithStories = new Map<number, User>();
+		for (const story of mockStories) {
+			if (story.user && !usersWithStories.has(story.user.pk)) {
+				usersWithStories.set(story.user.pk, story.user as unknown as User);
+			}
+		}
+
+		return [...usersWithStories.values()].map(user => ({
+			pk: typeof user.pk === 'string' ? user.pk : String(user.pk),
+			label: user.username,
+			content: [],
+		}));
+	}
+
+	async getStoriesForUser(
+		userId?: number | string,
+		username?: string,
+	): Promise<Story[]> {
+		// Find all stories for the given user
+		let userStories: Story[] = [];
+		if (username) {
+			userStories = mockStories.filter(story => {
+				return story.user?.username === username;
+			});
+		} else if (userId) {
+			logger.info(`Mock: Getting stories for user ${userId}`);
+			const userIdNum = typeof userId === 'string' ? Number(userId) : userId;
+			userStories = mockStories.filter(story => {
+				return story.user?.pk === userIdNum;
+			});
+		}
+
+		// Simulate network delay
+		await new Promise(resolve => {
+			setTimeout(resolve, 50);
+		});
+
+		return userStories;
+	}
+
+	async markStoriesAsSeen(stories: Story[]): Promise<void> {
+		// Simulate marking stories as seen
+		await new Promise(resolve => {
+			setTimeout(resolve, 50);
+		});
+		const username = stories[0]?.user?.username;
+		if (username) {
+			logger.info(
+				`Mock: Marked ${stories.length} stories as seen for user ${username}`,
+			);
+		}
+	}
+
+	// Login methods
+	async login(
+		username: string,
+		_password: string,
+		_options?: {initializeRealtime: boolean},
+	): Promise<LoginResult> {
+		await new Promise(resolve => {
+			setTimeout(resolve, 500);
+		}); // Simulate login delay
+		return {success: true, username};
+	}
+
+	async twoFactorLogin(_options: {
+		verificationCode: string;
+		twoFactorIdentifier: string;
+		totp_two_factor_on: boolean;
+	}): Promise<LoginResult> {
+		await new Promise(resolve => {
+			setTimeout(resolve, 300);
+		});
+		return {success: true, username: 'mock_user'};
+	}
+
+	async startChallenge(): Promise<void> {
+		await new Promise(resolve => {
+			setTimeout(resolve, 200);
+		});
+		logger.info('Mock: Challenge started');
+	}
+
+	async sendChallengeCode(_code: string): Promise<LoginResult> {
+		await new Promise(resolve => {
+			setTimeout(resolve, 300);
+		});
+		return {success: true, username: 'mock_user'};
+	}
+
+	async loginBySession(_options?: {
+		initializeRealtime: boolean;
+	}): Promise<LoginResult> {
+		// Simulate checking existing session
+		await new Promise(resolve => {
+			setTimeout(resolve, 200);
+		});
+		return {success: true, username: 'mock_user'};
+	}
+
+	async logout(_usernameToLogout?: string): Promise<void> {
+		await new Promise(resolve => {
+			setTimeout(resolve, 100);
+		});
+		logger.info('Mock: Logged out');
+	}
+
+	async shutdown(): Promise<void> {
+		logger.info('Mock: Client shutdown');
+	}
+
+	async switchUser(username: string): Promise<void> {
+		await new Promise(resolve => {
+			setTimeout(resolve, 100);
+		});
+		logger.info(`Mock: Switched to user ${username}`);
+	}
+
+	getUsername(): string | undefined {
+		return 'mock_user';
+	}
+
+	getRealtimeStatus(): RealtimeStatus {
+		return this.realtimeStatus;
+	}
+}
+
+// Type assertion to match InstagramClient interface
+export const mockClient = new MockClient() as unknown as InstagramClient;

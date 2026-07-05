@@ -1,0 +1,586 @@
+import {type DirectThreadFeedResponseItemsItem} from 'instagram-private-api';
+import {MessageSyncMessageTypes, type MessageSyncMessage} from 'instagram_mqtt';
+import type {
+	Message,
+	Post,
+	Reaction,
+	ReactionEvent,
+	RepliedToMessage,
+	SeenEvent,
+	MessageMedia,
+} from '../types/instagram.js';
+
+/**
+ * Roses are red,
+ * All the types are wrong.,
+ * So I monkey patch,
+ * And refactoring will take long.
+ */
+
+// We remove the item_type field to redefine it with proper type discrimination
+type ThreadBaseItem = Omit<DirectThreadFeedResponseItemsItem, 'item_type'>;
+
+// Chat is this real? Yes, this is real I love monkey patching
+// (this has been verified using the API response, the instagram-private-api type is outdated)
+// Note that thread_id may not exist here unlike MessageSyncMessage because you request a threadId already when calling this API
+type ThreadGenericMessageItem = ThreadBaseItem & {
+	media: MessageSyncMessage['media'];
+	reactions: MessageSyncMessage['reactions'];
+	// This type is NOT defined on either API or MQTT and is extended by monkey patching
+	replied_to_message?: RawRepliedToMessage;
+};
+
+type ThreadCommonMessageItem = ThreadGenericMessageItem & {
+	item_type: Exclude<
+		MessageSyncMessageTypes,
+		MessageSyncMessageTypes.ActionLog | MessageSyncMessageTypes.Link
+	>;
+};
+
+type RealLinkMessageItem = ThreadGenericMessageItem & {
+	item_type: MessageSyncMessageTypes.Link;
+	link?: {
+		text: string;
+		link_context: {
+			link_url: string;
+			link_title: string;
+			link_summary: string;
+			link_image_url: string;
+		};
+		mutation_token: string;
+		client_context: string;
+	};
+	text?: string;
+};
+
+type ActionLogItem = ThreadBaseItem & {
+	item_type: MessageSyncMessageTypes.ActionLog;
+	action_log: {
+		description: string;
+		bold: [unknown];
+		text_attributes: [unknown];
+		text_parts: [
+			{
+				text: string;
+			},
+		];
+		is_reaction_log: true;
+	};
+	hide_in_thread: 1 | 0;
+};
+
+/**
+ * Raw media share payload from Instagram API/MQTT.
+ */
+type RawMediaSharePayload = {
+	media?: RawMediaSharePayload;
+	user?: {
+		pk?: number;
+		id?: number;
+		username?: string;
+		profile_pic_url?: string;
+		profilePicUrl?: string;
+	};
+	id?: string;
+	pk?: number;
+	preview_medias?: RawMediaSharePayload[];
+	carousel_media?: Post['carousel_media'];
+	carousel_media_info?: Post['carousel_media'];
+	carousel_media_v2?: Post['carousel_media'];
+	carousel_media_count?: number;
+	caption?: string | {text: string};
+	image_versions2?: Post['image_versions2'];
+	video_versions?: Post['video_versions'];
+	like_count?: number;
+	comment_count?: number;
+	taken_at?: number;
+	media_type?: number;
+};
+
+/**
+ * MediaShare item type for shared posts (not reels).
+ * The media_share field contains the full post data.
+ */
+type MediaShareItem = ThreadGenericMessageItem & {
+	item_type: MessageSyncMessageTypes.MediaShare;
+	media_share?: RawMediaSharePayload;
+	xma_media_share?: RawMediaSharePayload;
+	direct_media_share?: RawMediaSharePayload;
+};
+
+type RealChatItem =
+	| ThreadCommonMessageItem
+	| RealLinkMessageItem
+	| ActionLogItem
+	| MediaShareItem;
+
+type RawRepliedToMessage = {
+	item_id: string;
+	user_id: number;
+	text?: string;
+	item_type: string;
+};
+
+/**
+ * The context required by the parser to resolve user information.
+ */
+export type MessageParsingContext = {
+	userCache: Map<string, string>;
+	currentUserId: string;
+};
+
+/**
+ * Options to configure message parsing behavior.
+ */
+export type MessageParsingOptions = {
+	isPreview: boolean;
+};
+
+const defaultParsingOptions: MessageParsingOptions = {
+	isPreview: false,
+};
+
+/**
+ * A standalone helper to get a username from a cache.
+ * @param userId The user ID to look up.
+ * @param userCache A map of user IDs to usernames.
+ * @param currentUserId The ID of the current logged-in user.
+ * @returns The username, 'You', or a default string.
+ */
+function getUsernameFromCache(
+	userId: number,
+	userCache: Map<string, string>,
+	currentUserId: string,
+): string {
+	const userIdString = userId.toString();
+	if (userIdString === currentUserId) {
+		return 'You';
+	}
+
+	const username = userCache.get(userIdString);
+	return username ?? `User_${userId}`;
+}
+
+/**
+ * Parses the `reactions` object from a message item.
+ * @param reactions The raw reactions object from the API/realtime payload.
+ * @returns An array of parsed `Reaction` objects or undefined.
+ */
+function parseReactions(
+	reactions: MessageSyncMessage['reactions'],
+): Reaction[] | undefined {
+	if (!reactions || (reactions.likes_count === 0 && !reactions.emojis)) {
+		return undefined;
+	}
+
+	const parsed: Reaction[] = [];
+
+	if (reactions.likes) {
+		for (const like of reactions.likes) {
+			parsed.push({emoji: '❤️', senderId: like.sender_id.toString()});
+		}
+	}
+
+	if (reactions.emojis) {
+		for (const emojiReaction of reactions.emojis) {
+			parsed.push({
+				emoji: emojiReaction.emoji,
+				senderId: emojiReaction.sender_id.toString(),
+			});
+		}
+	}
+
+	return parsed.length > 0 ? parsed : undefined;
+}
+
+/**
+ * Try to coerce any media-share-like payload into a Post the UI can render.
+ */
+function normalizeMediaShareToPost(
+	rawMediaShare: RawMediaSharePayload | undefined,
+): Post | undefined {
+	if (!rawMediaShare) return undefined;
+
+	const media = rawMediaShare.media ?? rawMediaShare;
+	const user = media.user ?? rawMediaShare.user;
+	const id = media.id ?? media.pk ?? rawMediaShare.id ?? rawMediaShare.pk;
+
+	if (!id || !user?.username) return undefined;
+
+	const primary = media.preview_medias?.[0] ?? media;
+	const carouselMedia =
+		media.carousel_media ??
+		media.carousel_media_info ??
+		media.carousel_media_v2;
+	const captionText =
+		typeof media.caption === 'string' ? media.caption : media.caption?.text;
+
+	return {
+		id: String(id),
+		user: {
+			pk: Number(user.pk ?? user.id ?? 0),
+			username: user.username,
+			profilePicUrl: user.profile_pic_url ?? user.profilePicUrl,
+		},
+		caption: captionText ? {text: captionText} : undefined,
+		image_versions2: media.image_versions2 ?? primary.image_versions2,
+		like_count: media.like_count ?? 0,
+		comment_count: media.comment_count ?? 0,
+		taken_at: media.taken_at ?? Math.floor(Date.now() / 1000),
+		media_type: media.media_type ?? primary.media_type ?? 1,
+		video_versions: media.video_versions ?? primary.video_versions,
+		carousel_media_count: media.carousel_media_count ?? carouselMedia?.length,
+		carousel_media: carouselMedia,
+	};
+}
+
+/**
+ * A shared parser for message items from any source (API or Realtime).
+ * @param item The raw message item object, likely MessageSyncMessage type from realtime
+ * @param context The context needed for parsing (e.g., user cache).
+ * @param options Parsing options and configuration.
+ * @returns A structured `Message` object or undefined if parsing fails.
+ *
+ * @note MessageSyncMessage is the well-typed interface from MQTT library
+ *       DirectThreadFeedResponseItemsItem from typescript-private-api can also be used,
+ *       but it must be cast to any because entries like media are not defined on the type
+ */
+export function parseMessageItem(
+	item: RealChatItem,
+	threadId: string,
+	context: MessageParsingContext,
+	options: MessageParsingOptions = defaultParsingOptions,
+): Message | undefined {
+	if (!item.item_id) return undefined;
+
+	const userId = item.user_id.toString();
+	const timestamp = new Date(Number(item.timestamp) / 1000);
+
+	const repliedToMessage =
+		item.item_type === MessageSyncMessageTypes.ActionLog
+			? undefined
+			: item.replied_to_message;
+	const repliedTo: RepliedToMessage | undefined = repliedToMessage
+		? {
+				id: repliedToMessage.item_id,
+				userId: repliedToMessage.user_id.toString(),
+				text: repliedToMessage.text,
+				itemType: repliedToMessage.item_type,
+				username: getUsernameFromCache(
+					repliedToMessage.user_id,
+					context.userCache,
+					context.currentUserId,
+				),
+			}
+		: undefined;
+
+	const baseMessage = {
+		id: item.item_id,
+		timestamp,
+		userId,
+		username: getUsernameFromCache(
+			Number(userId),
+			context.userCache,
+			context.currentUserId,
+		),
+		isOutgoing: userId === context.currentUserId,
+		threadId,
+		reactions: (item as ThreadGenericMessageItem).reactions
+			? parseReactions((item as ThreadGenericMessageItem).reactions)
+			: undefined,
+		repliedTo,
+		item_id: item.item_id,
+		// Requires type assertion because the field is not defined on MQTT message
+
+		client_context: (item as any).client_context,
+	};
+
+	switch (item.item_type) {
+		case MessageSyncMessageTypes.Text: {
+			return {...baseMessage, itemType: 'text', text: item.text ?? ''};
+		}
+
+		case MessageSyncMessageTypes.Media: {
+			const {media} = item;
+			if (!media) {
+				return {
+					...baseMessage,
+					itemType: 'placeholder',
+					text: '[Unsupported Media]',
+				};
+			}
+
+			return {
+				...baseMessage,
+				itemType: 'media',
+				media: {
+					id: media.id,
+					media_type: media.media_type,
+					original_width: media.original_width,
+					original_height: media.original_height,
+					// These two types are designed to be strictly subsets of the original ImageVersions and VideoVersions types
+					image_versions2: media.image_versions2,
+					video_versions: media.video_versions,
+				},
+			};
+		}
+
+		case MessageSyncMessageTypes.Link: {
+			if (item.link) {
+				return {
+					...baseMessage,
+					itemType: 'link',
+					link: {
+						text: item.link.text,
+						url: parseInstagramRedirectUrl(item.link.link_context.link_url),
+					},
+				};
+			}
+
+			if (item.text) {
+				return {
+					...baseMessage,
+					itemType: 'link',
+					link: {
+						text: item.text,
+						url: item.text,
+					},
+				};
+			}
+
+			return {
+				...baseMessage,
+				itemType: 'placeholder',
+				text: '[Sent a link]',
+			};
+		}
+
+		case MessageSyncMessageTypes.Like: {
+			return {
+				...baseMessage,
+				itemType: 'placeholder',
+				text: '[Sent a ❤️]',
+			};
+		}
+
+		case MessageSyncMessageTypes.MediaShare: {
+			const mediaShareItem = item as MediaShareItem;
+			const mediaShare =
+				mediaShareItem.media_share ??
+				mediaShareItem.xma_media_share ??
+				mediaShareItem.direct_media_share ??
+				(mediaShareItem.media as RawMediaSharePayload | undefined);
+
+			const post = normalizeMediaShareToPost(mediaShare);
+
+			if (!post) {
+				return {
+					...baseMessage,
+					itemType: 'placeholder',
+					text: '[Shared a post]',
+				};
+			}
+
+			return {
+				...baseMessage,
+				itemType: 'media_share',
+				mediaSharePost: post,
+			};
+		}
+
+		// Reels and RavenMedia (disappearing) remain as brainrot blockers
+		case MessageSyncMessageTypes.RavenMedia:
+		case MessageSyncMessageTypes.ReelShare: {
+			return {
+				...baseMessage,
+				itemType: 'placeholder',
+				text: `[igosint successfully blocked a brainrot]`,
+			};
+		}
+
+		case MessageSyncMessageTypes.ActionLog: {
+			if (options.isPreview || item.hide_in_thread === 0) {
+				return {
+					...baseMessage,
+					itemType: 'placeholder',
+					text: item.action_log.description,
+				};
+			}
+
+			return undefined;
+		}
+
+		default: {
+			// clip seems to be a new type that is not documented and is the same as brainrot / reels
+			if ((item.item_type as any) === 'clip') {
+				return {
+					...baseMessage,
+					itemType: 'placeholder',
+					text: `[igosint successfully blocked a brainrot]`,
+				};
+			}
+
+			return {
+				...baseMessage,
+				itemType: 'placeholder',
+				text: `[Unsupported Type: ${item.item_type}]`,
+			};
+		}
+	}
+}
+
+// More monkey patching!
+type CreateReactionEventMessage = {
+	path: string;
+	op: 'add' | 'replace' | string;
+	thread_id: string;
+	emoji: string;
+	super_react_type?: 'none';
+	timestamp: Date;
+};
+
+// When a user reacts to a message, Instagram may also send another realtime event like "user reacted emoji to your message".
+// This has nothing to do with the actual reaction on the message itself, and contains almost no useful information.
+// I suspect it's just tech debt / convenience event for Instagram to show a pretty unread message preview in their official app.
+/**
+ * A standalone helper to parse reaction events from mqtt realtime data.
+ * @param wrapper The raw event wrapper from realtime.on('message').
+ * @returns A structured `ReactionEvent` object or undefined if parsing fails.
+ */
+//
+export function parseReactionEvent(
+	message: CreateReactionEventMessage,
+): ReactionEvent | undefined {
+	try {
+		if (!message?.path || !message.thread_id) {
+			return undefined;
+		}
+
+		// Parse the path: /direct_v2/threads/{thread_id}/items/{item_id}/reactions/likes/{user_id}
+		const pathMatch =
+			/\/direct_v2\/threads\/([^/]+)\/items\/([^/]+)\/reactions\/(?:likes|emojis)\/([^/]+)/.exec(
+				message.path,
+			);
+
+		if (!pathMatch) {
+			return undefined;
+		}
+
+		const [, threadId, itemId, userId] = pathMatch;
+
+		if (!threadId || !itemId || !userId) {
+			return undefined;
+		}
+
+		return {
+			threadId,
+			itemId,
+			userId,
+			emoji: message.emoji || '❤',
+			timestamp: message.timestamp,
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Parses an Instagram redirect link to extract the original URL.
+ * This is to better protect privacy by avoiding Instagram's potential redirect tracking.
+ * @param url The Instagram redirect URL.
+ * @returns The original URL if found, otherwise the input URL.
+ */
+function parseInstagramRedirectUrl(url: string): string {
+	try {
+		const urlObj = new URL(url);
+		if (urlObj.hostname === 'l.instagram.com' && urlObj.searchParams.has('u')) {
+			const originalUrl = urlObj.searchParams.get('u');
+			if (originalUrl) {
+				return decodeURIComponent(originalUrl);
+			}
+		}
+	} catch {
+		// Ignore errors and return the original URL
+	}
+
+	return url;
+}
+
+type SeenEventMessage = {
+	path: string;
+	op: 'add' | 'replace' | string;
+	thread_id: string;
+	item_id: string;
+	client_context?: 'none';
+	timestamp: Date;
+	created_at: Date;
+	ssh_seen_state?: any;
+	disappearing_messages_seen_state?: any;
+};
+
+export function parseSeenEvent(
+	seenEvent: SeenEventMessage,
+): SeenEvent | undefined {
+	try {
+		if (!seenEvent?.path || !seenEvent.thread_id) {
+			return undefined;
+		}
+
+		// Parse the path: /direct_v2/threads/{thread_id}/participants/{user_id}/has_seen
+		const pathMatch =
+			/\/direct_v2\/threads\/([^/]+)\/participants\/([^/]+)\/has_seen/.exec(
+				seenEvent.path,
+			);
+
+		if (!pathMatch) {
+			return undefined;
+		}
+
+		const [, threadId, userId] = pathMatch;
+
+		if (!threadId || !userId) {
+			return undefined;
+		}
+
+		return {
+			threadId,
+			userId,
+			itemId: seenEvent.item_id,
+			timestamp: seenEvent.timestamp,
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Finds the highest-quality media URL from a MessageMedia object.
+ * Prefers video_versions when available, then falls back to image_versions2.
+ */
+export function getBestMediaUrl(
+	media: MessageMedia,
+): {url: string; type: 'image' | 'video'} | undefined {
+	if (media.video_versions && media.video_versions.length > 0) {
+		let best = media.video_versions[0]!;
+		for (const v of media.video_versions) {
+			if (v.width * v.height > best.width * best.height) {
+				best = v;
+			}
+		}
+
+		return {url: best.url, type: 'video'};
+	}
+
+	if (media.image_versions2 && media.image_versions2.candidates.length > 0) {
+		let best = media.image_versions2.candidates[0]!;
+		for (const img of media.image_versions2.candidates) {
+			if (img.width * img.height > best.width * best.height) {
+				best = img;
+			}
+		}
+
+		return {url: best.url, type: 'image'};
+	}
+
+	return undefined;
+}
