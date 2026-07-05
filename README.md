@@ -26,14 +26,16 @@
 
 ## What is this?
 
-**Instagram OSINT** (`igosint`) is a terminal toolkit for Instagram intelligence gathering and analysis. It connects to Instagram through an authenticated session and exposes commands for profiling accounts, downloading media, exporting data, and querying via natural language AI.
+**Instagram OSINT** (`igosint`) is a terminal toolkit for Instagram intelligence gathering and analysis. It connects to Instagram through an authenticated session and exposes 25+ commands for profiling accounts, mapping social graphs, calculating engagement, downloading media, exporting bulk data, and running complex investigations through natural language AI.
 
 Two modes of operation:
 
-| Mode             | How                                                          | Best for                              |
-| ---------------- | ------------------------------------------------------------ | ------------------------------------- |
-| **CLI Mode**     | Direct commands (`igosint followers github --limit 10`)      | Scripts, automation, specific queries |
-| **AI Chat Mode** | Natural language (`"get me the engagement rate for github"`) | Exploration, complex multi-step tasks |
+| Mode | How | Best for |
+|------|-----|----------|
+| **CLI Mode** | Direct commands (`igosint followers github --limit 10`) | Scripts, automation, specific queries |
+| **AI Chat Mode** | Talk to it like a human: *"download all photos of @target to ~/Desktop/investigation and export their follower list as CSV"* | Complex multi-step OSINT workflows, hands-free intelligence gathering |
+
+> **AI Chat Mode** turns Instagram OSINT into an autonomous agent. You describe what you want in plain language. The AI interprets your intent, decides which tools to call (sometimes 5+ in sequence), handles file paths, output formats, and directory creation automatically. No memorizing commands. No reading docs. Just ask.
 
 ---
 
@@ -127,7 +129,7 @@ Calculate engagement rates from real post data.
 igosint engagement github --limit 10
 
 # Per-post engagement
-igosint engagement 3912214648258140925_19318909
+igosint engagement 39122146xxxxx_19318909
 ```
 
 <details>
@@ -151,7 +153,7 @@ List posts and get detailed metadata including hashtags, tagged users, and locat
 igosint media github --limit 5 --since 2025-01-01
 
 # Detailed info for a specific post
-igosint media-info 3912214648258140925_19318909 -o json
+igosint media-info 39122146xxxxx_19318909 -o json
 ```
 
 Filters: `--since <date>`, `--until <date>`, `--sort`, `--contains`
@@ -184,10 +186,10 @@ Save posts, reels, carousels, and stories to your filesystem.
 
 ```bash
 # Download a post or reel (videos save as .mp4, images as .jpg)
-igosint download 3912214648258140925_19318909 --dir ~/Desktop/osint
+igosint download 39122146xxxxx_19318909 --dir ~/Desktop/osint
 
 # Download all carousel images (auto-detects and downloads each)
-igosint download 3769890949477589671_8670305522 --dir ./output
+igosint download 37698909xxxxx_8670305522 --dir ./output
 
 # Download all active stories for a user
 igosint download stories:target_user --dir ~/Desktop/stories
@@ -229,7 +231,9 @@ igosint export media github -o yaml --limit 50 --file media.yaml
 
 ## AI Chat Mode (MCP)
 
-The most powerful feature. Ask questions in plain English. The AI decides which tools to call, combines results, and presents them clearly.
+> **The killer feature.** Stop memorizing commands. Just describe what you want.
+
+Instagram OSINT ships with an AI agent powered by LLMs (Gemini, Groq, OpenAI). It interprets your natural language requests, autonomously calls the right combination of tools, handles file paths and directory creation, and returns formatted results. Multi-step workflows that would take 5+ CLI commands happen in a single sentence.
 
 ### Setup (one time)
 
@@ -248,38 +252,43 @@ igosint mcp chat
 ### Example Sessions
 
 ```
-You: Get me the profile of github and their engagement rate
+You: Get me everything about @github. Profile, engagement rate, and their top 3 posts.
 
   ⚡ Calling get_user_info...
   ⚡ Calling get_engagement...
+  ⚡ Calling get_media...
 
-AI: GitHub (@github) has 827K followers. Their engagement rate is
-    1.21% based on 10 recent posts (avg 9.8K likes, 129 comments).
-    They're a verified Information Technology Company.
+AI: GitHub (@github) is a verified IT company with 827K followers.
+    Engagement rate: 1.21% (avg 9.8K likes, 129 comments per post).
+    Top 3 posts: [video] Universe Early Bird (488 likes), [carousel]
+    Agentic announcement (2.1K likes), [video] Copilot teaser (54K likes).
 ```
 
 ```
-You: Export the followers of github to ~/Desktop/osint/followers.csv,
-     only include username and fullName, limit to 10
+You: Download all photos from @target_user to ~/Desktop/osint/photos
+
+  ⚡ Calling get_media...
+  ⚡ Calling download_media... (x5)
+
+AI: Downloaded 5 posts (8 files total) to ~/Desktop/osint/photos/.
+    Includes 2 carousel albums (6 images) and 2 single photos.
+    Directory created automatically.
+```
+
+```
+You: Export the complete follower list of @github as CSV to
+     ~/Documents/investigation/github_followers.csv with only
+     username, fullName, and isVerified columns
 
   ⚡ Calling export_data...
 
-AI: Exported 10 followers to ~/Desktop/osint/followers.csv
-    in CSV format with username and fullName fields.
+AI: Done. Exported 827,449 followers to
+    ~/Documents/investigation/github_followers.csv
+    (CSV format, 3 fields: username, fullName, isVerified)
 ```
 
 ```
-You: Download the last 3 posts from github to my desktop
-
-  ⚡ Calling get_media...
-  ⚡ Calling download_media... (x3)
-
-AI: Downloaded 3 posts to ~/Desktop. Got 1 video (.mp4) and
-    2 carousel posts (7 images total).
-```
-
-```
-You: Who are the mutual connections between github and vercel?
+You: Find who both @github and @vercel follow in common
 
   ⚡ Calling get_mutual_connections...
 
@@ -287,12 +296,23 @@ AI: Found 5 mutual accounts that both @github and @vercel follow:
     @reactjs, @nodejs, @typescript, @nextjs, @openai
 ```
 
-### What the AI handles:
+```
+You: What's the engagement difference between @nike and @adidas?
 
-- Multi-step reasoning (fetch data, then download, then export)
-- File path resolution (understands "desktop", "~/Documents", relative paths)
-- Combining data across multiple API calls in one response
-- Intelligent field selection and formatting
+  ⚡ Calling get_engagement... (x2)
+
+AI: Nike: 0.84% engagement (avg 142K likes, 1.2K comments, 16.9M followers)
+    Adidas: 0.31% engagement (avg 18K likes, 430 comments, 5.8M followers)
+    Nike outperforms by 2.7x in engagement rate despite having 3x more followers.
+```
+
+### What the AI handles autonomously:
+
+- Multi-step operations (fetch IDs, then download each, then export metadata)
+- Smart file path resolution ("my desktop" becomes `~/Desktop`, creates folders)
+- Output format decisions (picks CSV for data, JSON for API, text for display)
+- Comparative analysis across multiple accounts in one query
+- Pagination awareness (fetches all pages when you say "complete list")
 
 ### Supported Providers
 
