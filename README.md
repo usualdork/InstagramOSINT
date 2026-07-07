@@ -348,9 +348,6 @@ All JSON output uses a consistent envelope:
 
 ## Authentication
 
-<p align="center">
-  <img src="docs/screenshots/auth-status.png" alt="auth status" width="450"/>
-</p>
 
 ```bash
 igosint auth login       # Interactive login (username + password)
